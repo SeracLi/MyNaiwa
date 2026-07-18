@@ -1,0 +1,22 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# iCloud sync junk
+*.icloud
+
+# Products / build output
+*.app
+*.ipa
+*.dSYM.zip
+*.dSYM
