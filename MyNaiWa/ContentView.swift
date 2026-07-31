@@ -62,12 +62,12 @@ struct NaiwaAction: Identifiable {
     let id: String
     let name: String
     let clip: NaiwaClip
-    let symbol: String      // SF Symbol for the collection card
+    let emoji: String       // Apple emoji shown in the floating 动作 panel
     let owned: Bool         // prototype: everything owned; later: ad/coin/IAP
 
     static let catalog: [NaiwaAction] = [
-        NaiwaAction(id: "gun",   name: "打枪",   clip: .gun,   symbol: "scope",                 owned: true),
-        NaiwaAction(id: "taiji", name: "打太极", clip: .taiji, symbol: "figure.mind.and.body",  owned: true),
+        NaiwaAction(id: "gun",   name: "打枪",   clip: .gun,   emoji: "🔫", owned: true),
+        NaiwaAction(id: "taiji", name: "打太极", clip: .taiji, emoji: "🥋", owned: true),
     ]
 
     static func byId(_ id: String) -> NaiwaAction? { catalog.first { $0.id == id } }
@@ -88,10 +88,14 @@ enum NaiwaState: Equatable {
     case speaking       // 说话 playing (looping if needed), audio playing back
     case talkExiting    // 退出 playing
 
-    /// Tap-on-screen acceptance. Record button visibility is separate.
-    var isInteractable: Bool {
+    /// A clip driven by a body interaction (head/belly/laugh/floating/equipped
+    /// action). These support "连续点击倒退继播": re-tapping their zone rewinds
+    /// and keeps playing. NOTE: belly/head are shared with character-initiated
+    /// fillers — the rewind is additionally gated by `interactionRewindZone`
+    /// being non-nil, which only a USER tap sets, so self-motion stays inert.
+    var isUserInteraction: Bool {
         switch self {
-        case .idle, .laugh: return true
+        case .fillerBelly, .fillerHead, .action, .laugh, .floating: return true
         default: return false
         }
     }
@@ -173,8 +177,43 @@ struct VoicePreset: Identifiable {
         VoicePreset(id: "smoke", name: "粗糙烟嗓", pitchCents: -400, distortion: .radioTower, distortionMix: 25, eqBassGain: 2, eqBassFreq: 200),
         VoicePreset(id: "alien", name: "外星深沉", pitchCents: -800, distortion: .cosmic,     distortionMix: 28, eqBassGain: 0, eqBassFreq: 150),
         VoicePreset(id: "clean", name: "干净深沉", pitchCents: -600, distortion: .none,       distortionMix: 0,  eqBassGain: 5, eqBassFreq: 120),
-        VoicePreset(id: "raw",   name: "原声",     pitchCents: 0,    distortion: .none,       distortionMix: 0,  eqBassGain: 0, eqBassFreq: 150),
+        VoicePreset(id: "raw",   name: "原声",     pitchCents: 0,    distortion: .none,       distortionMix: 0,  eqBassGain: 0,  eqBassFreq: 150),
+        VoicePreset(id: "loli",  name: "萝莉音",   pitchCents: 700,  distortion: .none,       distortionMix: 0,  eqBassGain: -3, eqBassFreq: 200),
     ]
+}
+
+// MARK: - User-facing voices (音色切换)
+
+/// A voice the *user* can switch between from the main screen (奶蛙原声 / 萝莉音).
+/// Unlike the dev-only `VoicePreset`, a profile carries the FULL chain including
+/// the clarity toggles (降噪 / 人声增强), so selecting one fully defines how奶蛙
+/// sounds. This is also the future 语音包 monetization slot — new voices arrive
+/// as data entries here, gated by owned/price later.
+struct NaiwaVoiceProfile: Identifiable {
+    let id: String
+    let name: String
+    let emoji: String               // Apple emoji shown in the floating 音色 panel
+    let pitchCents: Float
+    let distortion: DistortionPreset
+    let distortionMix: Float
+    let eqBassGain: Float
+    let eqBassFreq: Float
+    let noiseReduction: Bool
+    let voiceBoost: Bool
+
+    static let all: [NaiwaVoiceProfile] = [
+        NaiwaVoiceProfile(id: "naiwa", name: "奶蛙原声", emoji: "🐸",
+                          pitchCents: -900, distortion: .none, distortionMix: 0,
+                          eqBassGain: -4, eqBassFreq: 210,
+                          noiseReduction: true, voiceBoost: false),
+        NaiwaVoiceProfile(id: "loli", name: "萝莉音", emoji: "👧",
+                          pitchCents: 700, distortion: .none, distortionMix: 0,
+                          eqBassGain: -3, eqBassFreq: 200,
+                          noiseReduction: true, voiceBoost: true),
+    ]
+
+    static let defaultId = "naiwa"
+    static func byId(_ id: String) -> NaiwaVoiceProfile? { all.first { $0.id == id } }
 }
 
 @MainActor
@@ -225,6 +264,12 @@ final class NaiwaVoice: ObservableObject {
     }
     private static let presenceGain: Float = 4.5   // dB @ high shelf
 
+    /// Which user-facing voice is selected (奶蛙原声 / 萝莉音). Persisted so the
+    /// choice survives relaunch. Set via `applyVoiceProfile`.
+    @Published var selectedVoiceId: String = NaiwaVoiceProfile.defaultId {
+        didSet { defaults.set(selectedVoiceId, forKey: Keys.selectedVoice) }
+    }
+
     private let engine = AVAudioEngine()
     private let playerNode = AVAudioPlayerNode()
     private let pitchUnit = AVAudioUnitTimePitch()
@@ -246,6 +291,7 @@ final class NaiwaVoice: ObservableObject {
         static let eqBassFreq     = "naiwa_voice_eqBassFreq"
         static let noiseReduction = "naiwa_voice_noiseReduction"
         static let voiceBoost     = "naiwa_voice_voiceBoost"
+        static let selectedVoice  = "naiwa_voice_selectedProfile"
     }
 
     private var recordingBuffer: AVAudioPCMBuffer?
@@ -292,6 +338,31 @@ final class NaiwaVoice: ObservableObject {
 
         // Apply presence gain to band 1 based on restored/default voiceBoost.
         eqUnit.bands[1].gain = voiceBoost ? Self.presenceGain : 0
+
+        // Restore the user's selected voice. On a FRESH install (no saved
+        // choice) apply the default profile so the shipped app starts on a
+        // fully-defined奶蛙原声 rather than the bare code defaults. If a choice
+        // was saved, trust the per-param values restored above (this also lets
+        // the dev tune freely via the debug panel without being overwritten).
+        if let savedVoice = defaults.string(forKey: Keys.selectedVoice) {
+            selectedVoiceId = savedVoice
+        } else if let profile = NaiwaVoiceProfile.byId(NaiwaVoiceProfile.defaultId) {
+            applyVoiceProfile(profile)
+        }
+    }
+
+    /// Switch the whole voice chain to a user-facing profile (奶蛙原声 / 萝莉音).
+    /// Sets every param including the clarity toggles; each setter persists and
+    /// pushes to its audio unit, so the change is live and survives relaunch.
+    func applyVoiceProfile(_ profile: NaiwaVoiceProfile) {
+        selectedVoiceId  = profile.id
+        pitchCents       = profile.pitchCents
+        distortionPreset = profile.distortion
+        distortionMix    = profile.distortionMix
+        eqBassGain       = profile.eqBassGain
+        eqBassFreq       = profile.eqBassFreq
+        noiseReduction   = profile.noiseReduction
+        voiceBoost       = profile.voiceBoost
     }
 
     /// Toggling noise reduction requires re-enabling Voice Processing on the
@@ -651,6 +722,12 @@ final class NaiwaPlayer: ObservableObject {
     /// How far each right-side tap rewinds the current action (seconds).
     private let actionRewindStep: TimeInterval = 0.5
 
+    /// The tap zone that STARTED the current user-triggered interaction. Tapping
+    /// this same zone again rewinds & keeps playing (打枪/太极 feel, extended to
+    /// all body interactions). Nil while idle or when奶蛙 self-triggered a filler,
+    /// so those taps do nothing — only user-initiated motion is scrubbable.
+    private var interactionRewindZone: TapZone?
+
     /// The equipped right-arm action, persisted. Tapping奶蛙's left arm plays it.
     @Published var equippedActionId: String = NaiwaAction.defaultId {
         didSet { UserDefaults.standard.set(equippedActionId, forKey: "naiwa_equippedAction") }
@@ -781,6 +858,7 @@ final class NaiwaPlayer: ObservableObject {
         isButtonHeld = false
         pendingFinalize = false
         pendingSpeakStart = false
+        interactionRewindZone = nil
 
         // Re-attach + rewind every player so none of them are stuck blank.
         for (clip, player) in players {
@@ -831,12 +909,15 @@ final class NaiwaPlayer: ObservableObject {
                 let next: NaiwaClip = (lastFiller == .belly) ? .head : .belly
                 lastFiller = next
                 state = (next == .belly) ? .fillerBelly : .fillerHead
+                // Character-initiated → not user-scrubbable (taps stay inert).
+                interactionRewindZone = nil
                 switchTo(next)
             } else {
                 switchTo(.idle)
             }
         case .fillerBelly, .fillerHead, .action, .laugh, .floating:
             state = .idle
+            interactionRewindZone = nil
             switchTo(.idle)
         case .talkEntering:
             // Enter clip done — decide based on whether user is still holding.
@@ -929,21 +1010,20 @@ final class NaiwaPlayer: ObservableObject {
     // MARK: Tap dispatch (existing flow — unchanged)
 
     func handleTap(_ zone: TapZone) {
-        // Experimental: tapping the right side WHILE an action is playing
-        // rewinds it ~0.5s and keeps going (e.g. "keep shooting"). This is the
-        // one interruptible filler; it happens before the isInteractable gate.
-        if state == .action, zone == .rightEdge {
+        // "连续点击倒退继播": if the user re-taps the SAME zone that started the
+        // current interaction, rewind it ~0.5s and keep playing (打枪/太极 feel,
+        // now on 大笑/摸肚子/浮起来/挠头 too). `interactionRewindZone` is only set
+        // by a user tap below, so a character-initiated filler (belly/head from
+        // the idle loop) has it nil and these taps are ignored.
+        if let rewindZone = interactionRewindZone, zone == rewindZone, state.isUserInteraction {
             rewindAction()
             return
         }
 
-        guard state.isInteractable else { return }
-
-        if state == .laugh {
-            state = .idle
-            switchTo(.idle)
-            return
-        }
+        // Otherwise a fresh interaction only starts from a resting idle. Taps
+        // during any ongoing clip (a running interaction, a self-filler, or
+        // talk mode) do nothing.
+        guard state == .idle else { return }
 
         switch zone {
         case .head:
@@ -964,6 +1044,20 @@ final class NaiwaPlayer: ObservableObject {
             state = .floating
             switchTo(.floating)
         }
+        // Remember which zone owns this interaction so re-taps scrub it.
+        interactionRewindZone = zone
+    }
+
+    /// Play a specific action's clip once (from the floating 动作 panel) WITHOUT
+    /// changing what's equipped — a tap on a panel item. Interrupts a filler /
+    /// laugh / floating / running action, but never talk mode. Re-tapping奶蛙's
+    /// right arm during it rewinds like a normal equipped action.
+    func playAction(_ actionId: String) {
+        guard let action = NaiwaAction.byId(actionId), action.owned,
+              !state.isInTalkMode else { return }
+        state = .action
+        interactionRewindZone = .rightEdge
+        switchTo(action.clip)
     }
 
     /// Rewind the currently-playing action by `actionRewindStep`, clamped at
@@ -972,7 +1066,7 @@ final class NaiwaPlayer: ObservableObject {
     /// from stacking seeks and stuttering. A small tolerance keeps the rewind
     /// snappy rather than frame-accurate (better feel for a "keep going" tap).
     private func rewindAction() {
-        guard state == .action, !actionSeeking, let p = players[currentClip] else { return }
+        guard state.isUserInteraction, !actionSeeking, let p = players[currentClip] else { return }
         let cur = CMTimeGetSeconds(p.currentTime())
         guard cur.isFinite else { return }
         let target = max(0, cur - actionRewindStep)
@@ -983,8 +1077,8 @@ final class NaiwaPlayer: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.actionSeeking = false
-                // Still mid-action? keep it rolling (seek can leave rate at 0).
-                if self.state == .action, let p = self.players[self.currentClip], p.rate == 0 {
+                // Still mid-interaction? keep it rolling (seek can leave rate at 0).
+                if self.state.isUserInteraction, let p = self.players[self.currentClip], p.rate == 0 {
                     p.play()
                 }
             }
@@ -1249,31 +1343,92 @@ struct ContentView: View {
     @StateObject private var naiwa = NaiwaPlayer()
     @State private var showHitZones = false
     @State private var showDebug = false
-    @State private var showActions = false
+    @State private var showSettings = false
+    @State private var actionsPanelOpen = false
+    @State private var voicesPanelOpen = false
+    @State private var toast: String?
+    @State private var toastTask: Task<Void, Never>?
 
-    private let edgeFraction: CGFloat = 0.18
-    private let upperBodyFraction: CGFloat = 0.60
-
-    /// 奶蛙's head, expressed in VIDEO-normalized coords (0-1 within the 9:16
-    /// source frame), NOT screen coords. Taps are mapped back through the
-    /// aspect-fill transform before testing, so this stays correct on both
-    /// iPhone and iPad regardless of how the video is cropped to fit.
-    /// Generously sized per request — better to over-cover the head a bit.
-    private let headRect = CGRect(x: 0.26, y: 0.12, width: 0.34, height: 0.28)
+    /// Hit-zones as explicit rectangles in VIDEO-normalized coords (0-1 within
+    /// the 9:16 source frame), NOT screen coords. Taps are mapped back through
+    /// the aspect-fill transform before testing, so a zone tracks奶蛙's body on
+    /// any device aspect ratio. Tested in array order — FIRST hit wins — and a
+    /// tap that lands in no rectangle does nothing (the empty/black areas).
+    ///
+    /// This table IS the tuning surface: each new scene gets its zones by
+    /// tracing a reference layout image (colors here match that image — 黄挠头 /
+    /// 绿摸肚子 / 紫打枪 / 红大笑 / 蓝浮起来) and pasting the measured rects here.
+    private let zoneLayout: [(zone: TapZone, rect: CGRect)] = [
+        (.head,        CGRect(x: 0.313, y: 0.135, width: 0.300, height: 0.198)),  // 黄 挠头
+        (.leftEdge,    CGRect(x: 0.000, y: 0.213, width: 0.313, height: 0.385)),  // 绿 摸肚子
+        (.rightEdge,   CGRect(x: 0.613, y: 0.213, width: 0.387, height: 0.385)),  // 紫 打枪
+        (.upperMiddle, CGRect(x: 0.313, y: 0.333, width: 0.300, height: 0.265)),  // 红 大笑
+        (.lowerMiddle, CGRect(x: 0.000, y: 0.598, width: 1.000, height: 0.402)),  // 蓝 浮起来
+    ]
 
     /// All clips are 9:16 (720×1280 and 1792×3184 both ≈ 0.5625 w/h).
     private let videoAspect: CGFloat = 9.0 / 16.0
 
     var body: some View {
         GeometryReader { geo in
+            // The video ignores safe area → it's laid out across the FULL
+            // screen. Zone math must use that full rect (in the reader's local
+            // coords, so the physical top-left is negative), otherwise zones get
+            // squeezed into the safe area and drift down while 浮起来 loses its
+            // lower half under the home indicator. Reduces to geo.size when the
+            // safe-area insets are 0.
+            let insets = geo.safeAreaInsets
+            let videoBounds = CGRect(
+                x: -insets.leading,
+                y: -insets.top,
+                width: geo.size.width + insets.leading + insets.trailing,
+                height: geo.size.height + insets.top + insets.bottom
+            )
+            // Same full-screen video rect but with a ZERO origin — the coord
+            // space of the safe-area-ignoring tap layer, whose local origin is
+            // the physical screen top-left.
+            let screenBounds = CGRect(origin: .zero, size: videoBounds.size)
             ZStack {
                 Color.black.ignoresSafeArea()
 
                 NaiwaSurface(view: naiwa.hostView)
                     .ignoresSafeArea()
 
+                // Full-screen tap layer (ignores safe area) so 浮起来 hit-tests
+                // all the way to the physical bottom edge, including the home-
+                // indicator strip. Below the chrome buttons so they keep tap
+                // priority. Coordinates are physical (origin = screen top-left),
+                // matching `screenBounds`.
+                Color.clear
+                    .ignoresSafeArea()
+                    .contentShape(Rectangle())
+                    .gesture(
+                        SpatialTapGesture()
+                            .onEnded { event in
+                                if let zone = zone(for: event.location, in: screenBounds) {
+                                    naiwa.handleTap(zone)
+                                }
+                            }
+                    )
+
                 if showHitZones {
-                    debugOverlay(in: geo.size)
+                    // Pin the overlay to the reader's size (top-left anchored) so
+                    // the oversized (aspect-fill) rects can't inflate the parent
+                    // ZStack — GeometryReader would anchor that top-left and shove
+                    // the video + buttons right. NO .clipped(): 浮起来 is allowed to
+                    // draw past the safe area down to the physical bottom edge.
+                    debugOverlay(in: videoBounds)
+                        .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
+                }
+
+                // Outside-tap catcher for the floating panels. Sits below the
+                // chrome buttons so 动作/音色/录音 keep tap priority; any tap
+                // elsewhere collapses the open panel.
+                if actionsPanelOpen || voicesPanelOpen {
+                    Color.clear
+                        .ignoresSafeArea()
+                        .contentShape(Rectangle())
+                        .onTapGesture { closePanels() }
                 }
 
                 // Top chrome: dev debug (left) + user settings placeholder (right).
@@ -1284,9 +1439,11 @@ struct ContentView: View {
                         circleIconButton("ladybug.fill", size: 17) { showDebug = true }
                             .padding(.leading, 14)
                         Spacer()
-                        // User-facing settings — placeholder, no action yet.
-                        circleIconButton("line.3.horizontal", size: 19) { }
-                            .padding(.trailing, 14)
+                        // User-facing settings.
+                        circleIconButton("line.3.horizontal", size: 19) {
+                            withAnimation(.easeInOut(duration: 0.15)) { showSettings = true }
+                        }
+                        .padding(.trailing, 14)
                     }
                     .padding(.top, 12)
                     Spacer()
@@ -1302,53 +1459,212 @@ struct ContentView: View {
                         .animation(.easeInOut(duration: 0.18), value: naiwa.state)
                         .frame(height: 18)   // fixed height so button doesn't jump
 
-                    ZStack {
+                    // One row: 动作 (left) · record (center) · 音色 (right).
+                    // Equal-width side buttons + equal Spacers keep the record
+                    // button centered. Deliberately NO maxWidth:.infinity — that
+                    // inflated the parent ZStack past the screen width, and since
+                    // GeometryReader anchors content at its top-left, it shifted
+                    // everything (video + buttons) right with the right edge cut off.
+                    HStack {
+                        bottomChromeButton("figure.run") { toggleActionsPanel() }
+                        Spacer()
                         RecordButton(
                             isActive:  naiwa.isRecording,
                             isEnabled: naiwa.recordButtonEnabled,
-                            onPress:   { naiwa.recordButtonPressed() },
+                            onPress:   { closePanels(); naiwa.recordButtonPressed() },
                             onRelease: { naiwa.recordButtonReleased() }
                         )
-                        // Actions button sits to the right of the record button.
-                        HStack {
-                            Spacer()
-                            Button { showActions = true } label: {
-                                VStack(spacing: 3) {
-                                    Image(systemName: "figure.run")
-                                        .font(.system(size: 22, weight: .semibold))
-                                    Text("动作")
-                                        .font(.system(size: 11, weight: .semibold))
-                                }
-                                .foregroundColor(.white)
-                                .frame(width: 58, height: 58)
-                                .background(Color.black.opacity(0.30))
-                                .clipShape(Circle())
-                            }
-                            .padding(.trailing, 26)
-                        }
+                        Spacer()
+                        bottomChromeButton("waveform") { toggleVoicesPanel() }
                     }
+                    .padding(.horizontal, 26)
                 }
                 .padding(.bottom, 26)
-            }
-            .contentShape(Rectangle())
-            .gesture(
-                SpatialTapGesture()
-                    .onEnded { event in
-                        let zone = zone(for: event.location, in: geo.size)
-                        naiwa.handleTap(zone)
+
+                // Floating panels sit ABOVE the chrome so their items are fully
+                // tappable and can overlap the buttons. Anchored just above their
+                // triggering corner button (Tom-Cat style).
+                if actionsPanelOpen {
+                    actionPanel
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                        .padding(.leading, 18)
+                        .padding(.bottom, 104)
+                        .transition(.scale(scale: 0.6, anchor: .bottomLeading).combined(with: .opacity))
+                }
+                if voicesPanelOpen {
+                    voicePanel
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                        .padding(.trailing, 18)
+                        .padding(.bottom, 104)
+                        .transition(.scale(scale: 0.6, anchor: .bottomTrailing).combined(with: .opacity))
+                }
+
+                // Transient toast — brief confirmation (e.g. equipping an action).
+                // Top-center, above everything, never blocks touches.
+                if let toast {
+                    Text(toast)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 11)
+                        .background(Capsule().fill(Color.black.opacity(0.8)))
+                        .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 0.5))
+                        .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                        .padding(.top, 78)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                        .allowsHitTesting(false)
+                }
+
+                // Settings page as a top-most overlay (not a sheet) so it simply
+                // appears/fades instead of sliding up from the bottom.
+                if showSettings {
+                    NavigationStack {
+                        SettingsView(onClose: {
+                            withAnimation(.easeInOut(duration: 0.15)) { showSettings = false }
+                        })
                     }
-            )
+                    .transition(.opacity)
+                }
+            }
         }
         .statusBarHidden()
         .sheet(isPresented: $showDebug) {
             DebugPanel(voice: naiwa.voice, showHitZones: $showHitZones)
         }
-        .sheet(isPresented: $showActions) {
-            ActionCollectionView(
-                equippedId: naiwa.equippedActionId,
-                onEquip: { naiwa.equippedActionId = $0 }
-            )
-            .presentationDetents([.medium, .large])
+    }
+
+    // MARK: Floating panels (动作 / 音色)
+
+    private var actionPanel: some View {
+        floatingPanel(caption: "点击播放 · 长按设为右手动作") {
+            ForEach(NaiwaAction.catalog) { action in
+                floatingItem(emoji: action.emoji,
+                             label: action.name,
+                             selected: action.id == naiwa.equippedActionId,
+                             onTap: { naiwa.playAction(action.id); closePanels() },
+                             onLongPress: {
+                                 naiwa.equippedActionId = action.id
+                                 impact()
+                                 closePanels()
+                                 showToast("\(action.emoji) \(action.name) 已设为右手动作")
+                             })
+            }
+        }
+    }
+
+    private var voicePanel: some View {
+        floatingPanel(caption: "点击切换音色") {
+            ForEach(NaiwaVoiceProfile.all) { profile in
+                floatingItem(emoji: profile.emoji,
+                             label: profile.name,
+                             selected: profile.id == naiwa.voice.selectedVoiceId,
+                             onTap: {
+                                 naiwa.voice.applyVoiceProfile(profile)
+                                 impact()
+                                 closePanels()
+                             })
+            }
+        }
+    }
+
+    /// Rounded frosted card holding a row of items + a caption. Shared by both
+    /// panels so 动作 and 音色 look identical.
+    private func floatingPanel<Content: View>(caption: String,
+                                              @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) { content() }
+            Text(caption)
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(Color.white.opacity(0.18), lineWidth: 0.5)
+        )
+        .shadow(color: .black.opacity(0.28), radius: 16, y: 8)
+    }
+
+    /// One selectable item chip (emoji over label). Tap fires `onTap`; an
+    /// optional long-press fires `onLongPress` (used by 动作 to equip).
+    private func floatingItem(emoji: String, label: String, selected: Bool,
+                              onTap: @escaping () -> Void,
+                              onLongPress: (() -> Void)? = nil) -> some View {
+        VStack(spacing: 4) {
+            Text(emoji).font(.system(size: 34))
+            Text(label)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.primary)
+        }
+        .frame(width: 76, height: 78)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(selected ? Color.accentColor.opacity(0.18) : Color.primary.opacity(0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(selected ? Color.accentColor : .clear, lineWidth: 2)
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .onTapGesture { onTap() }
+        .onLongPressGesture(minimumDuration: 0.35) { onLongPress?() }
+    }
+
+    private func toggleActionsPanel() {
+        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+            voicesPanelOpen = false
+            actionsPanelOpen.toggle()
+        }
+    }
+
+    private func toggleVoicesPanel() {
+        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+            actionsPanelOpen = false
+            voicesPanelOpen.toggle()
+        }
+    }
+
+    private func closePanels() {
+        guard actionsPanelOpen || voicesPanelOpen else { return }
+        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+            actionsPanelOpen = false
+            voicesPanelOpen = false
+        }
+    }
+
+    private func impact() {
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+    }
+
+    /// Show a transient toast for ~1.6s. Re-calling replaces the current one
+    /// (the previous auto-dismiss task is cancelled).
+    private func showToast(_ text: String) {
+        toastTask?.cancel()
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) { toast = text }
+        toastTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_600_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.25)) { toast = nil }
+        }
+    }
+
+    /// Bottom-corner chrome button (动作 / 音色) — icon-only in a translucent
+    /// circle (label dropped for a cleaner screen; the icon + opened panel are
+    /// self-explanatory, and more category buttons are coming). Shared so every
+    /// corner button stays visually identical.
+    private func bottomChromeButton(_ symbol: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundColor(.white)
+                .frame(width: 56, height: 56)
+                .background(Color.black.opacity(0.30))
+                .clipShape(Circle())
         }
     }
 
@@ -1376,202 +1692,88 @@ struct ContentView: View {
         }
     }
 
-    private func zone(for point: CGPoint, in size: CGSize) -> TapZone {
-        // Head takes priority over the edge/middle split. Test in video space
-        // so it lands on奶蛙's head on any device aspect ratio.
-        if headRect.contains(videoNormalizedPoint(for: point, in: size)) {
-            return .head
-        }
-        let leftMax  = size.width * edgeFraction
-        let rightMin = size.width * (1 - edgeFraction)
-        if point.x < leftMax  { return .leftEdge }
-        if point.x > rightMin { return .rightEdge }
-        return point.y < size.height * upperBodyFraction ? .upperMiddle : .lowerMiddle
+    private func zone(for point: CGPoint, in bounds: CGRect) -> TapZone? {
+        // Test every rect in video space (so it tracks奶蛙 on any aspect ratio),
+        // in priority order — head is listed first so it wins over the columns
+        // it sits between. No rect contains the point → nil (empty area).
+        let p = videoNormalizedPoint(for: point, in: bounds)
+        return zoneLayout.first { $0.rect.contains(p) }?.zone
     }
 
-    /// The video's displayed rect on screen under `.resizeAspectFill` (it
-    /// overflows the screen; the offset is negative on the cropped axis).
-    private func displayedVideoRect(in size: CGSize) -> CGRect {
-        let screenAspect = size.width / size.height
-        var w = size.width, h = size.height
-        if screenAspect > videoAspect {
-            // Screen wider than video → fill width, crop top/bottom.
-            w = size.width
-            h = size.width / videoAspect
+    /// The video's displayed rect (in `bounds`' coordinate space) under
+    /// `.resizeAspectFill` — it overflows the container; the offset is negative
+    /// on the cropped axis. `bounds` is the FULL-screen video rect, which may
+    /// start at a negative origin (it extends under the safe-area insets).
+    private func displayedVideoRect(in bounds: CGRect) -> CGRect {
+        let containerAspect = bounds.width / bounds.height
+        var w = bounds.width, h = bounds.height
+        if containerAspect > videoAspect {
+            // Container wider than video → fill width, crop top/bottom.
+            w = bounds.width
+            h = bounds.width / videoAspect
         } else {
-            // Screen taller/narrower → fill height, crop sides.
-            h = size.height
-            w = size.height * videoAspect
+            // Container taller/narrower → fill height, crop sides.
+            h = bounds.height
+            w = bounds.height * videoAspect
         }
-        return CGRect(x: (size.width - w) / 2, y: (size.height - h) / 2, width: w, height: h)
+        return CGRect(x: bounds.midX - w / 2, y: bounds.midY - h / 2, width: w, height: h)
     }
 
     /// Screen point → video-normalized (0-1) coordinate, inverting aspect-fill.
-    private func videoNormalizedPoint(for p: CGPoint, in size: CGSize) -> CGPoint {
-        let r = displayedVideoRect(in: size)
+    private func videoNormalizedPoint(for p: CGPoint, in bounds: CGRect) -> CGPoint {
+        let r = displayedVideoRect(in: bounds)
         return CGPoint(x: (p.x - r.minX) / r.width,
                        y: (p.y - r.minY) / r.height)
     }
 
-    /// Head hit-box mapped forward into screen coords (for the debug overlay).
-    private func headScreenRect(in size: CGSize) -> CGRect {
-        let r = displayedVideoRect(in: size)
-        return CGRect(x: r.minX + headRect.minX * r.width,
-                      y: r.minY + headRect.minY * r.height,
-                      width: headRect.width * r.width,
-                      height: headRect.height * r.height)
+    /// Map a video-normalized rect forward into on-screen coords (aspect-fill),
+    /// so the debug overlay lines up exactly with the hit-test rects.
+    private func videoRectToScreen(_ r: CGRect, in bounds: CGRect) -> CGRect {
+        let v = displayedVideoRect(in: bounds)
+        return CGRect(x: v.minX + r.minX * v.width,
+                      y: v.minY + r.minY * v.height,
+                      width: r.width * v.width,
+                      height: r.height * v.height)
     }
 
-    private func debugOverlay(in size: CGSize) -> some View {
-        let edgeW = size.width * edgeFraction
-        let upperH = size.height * upperBodyFraction
-        let head = headScreenRect(in: size)
-        return ZStack(alignment: .topLeading) {
-            HStack(spacing: 0) {
+    /// Debug hit-zone overlay — draws every `zoneLayout` rect in its matching
+    /// color/label so the tuning image and the live zones can be compared 1:1.
+    /// The caller pins this to the reader's size + clips (the zone rects overflow
+    /// the screen under aspect-fill and would otherwise inflate the layout).
+    private func debugOverlay(in bounds: CGRect) -> some View {
+        ZStack(alignment: .topLeading) {
+            ForEach(Array(zoneLayout.enumerated()), id: \.offset) { _, entry in
+                let r = videoRectToScreen(entry.rect, in: bounds)
                 ZStack {
-                    Color.green.opacity(0.20)
-                    Text("摸肚子")
-                        .foregroundColor(.white).font(.headline).shadow(radius: 4)
-                        .rotationEffect(.degrees(-90))
+                    debugColor(for: entry.zone).opacity(0.30)
+                    Text(debugLabel(for: entry.zone))
+                        .foregroundColor(.white).font(.caption).bold()
+                        .shadow(color: .black.opacity(0.6), radius: 3)
                 }
-                .frame(width: edgeW)
-                VStack(spacing: 0) {
-                    ZStack {
-                        Color.red.opacity(0.18)
-                        Text("上半身 → 大笑")
-                            .foregroundColor(.white).font(.headline).shadow(radius: 4)
-                    }
-                    .frame(height: upperH)
-                    ZStack {
-                        Color.blue.opacity(0.18)
-                        Text("下半身 → 浮起来")
-                            .foregroundColor(.white).font(.headline).shadow(radius: 4)
-                    }
-                }
-                ZStack {
-                    Color.purple.opacity(0.20)
-                    Text("打枪")
-                        .foregroundColor(.white).font(.headline).shadow(radius: 4)
-                        .rotationEffect(.degrees(90))
-                }
-                .frame(width: edgeW)
+                .frame(width: r.width, height: r.height)
+                .offset(x: r.minX, y: r.minY)
             }
-
-            // Head hit-box overlaid on top (highest priority zone).
-            ZStack {
-                Color.yellow.opacity(0.30)
-                Text("头 → 挠头")
-                    .foregroundColor(.black).font(.caption).bold()
-            }
-            .frame(width: head.width, height: head.height)
-            .offset(x: head.minX, y: head.minY)
         }
-        .ignoresSafeArea()
         .allowsHitTesting(false)
     }
-}
 
-// MARK: - Action collection (图鉴 / equip)
-
-struct ActionCollectionView: View {
-    let equippedId: String
-    let onEquip: (String) -> Void
-    @Environment(\.dismiss) private var dismiss
-
-    private let columns = [GridItem(.adaptive(minimum: 100), spacing: 14)]
-
-    var body: some View {
-        NavigationStack {
-            ScrollView {
-                Text("点击奶蛙的左手（屏幕右侧）会触发当前装备的动作")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 16)
-                    .padding(.top, 8)
-
-                LazyVGrid(columns: columns, spacing: 14) {
-                    ForEach(NaiwaAction.catalog) { action in
-                        actionCard(action)
-                    }
-                    comingSoonCard
-                }
-                .padding(16)
-            }
-            .navigationTitle("动作")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("完成") { dismiss() }
-                }
-            }
+    private func debugColor(for zone: TapZone) -> Color {
+        switch zone {
+        case .head:        return .yellow
+        case .leftEdge:    return .green
+        case .rightEdge:   return .purple
+        case .upperMiddle: return .red
+        case .lowerMiddle: return .blue
         }
     }
 
-    private func actionCard(_ action: NaiwaAction) -> some View {
-        let isEquipped = action.id == equippedId
-        return Button {
-            guard action.owned else { return }   // future: buy / watch-ad flow
-            onEquip(action.id)
-        } label: {
-            VStack(spacing: 8) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .fill(isEquipped ? Color.accentColor.opacity(0.18) : Color(.systemGray6))
-                    Image(systemName: action.symbol)
-                        .font(.system(size: 30, weight: .medium))
-                        .foregroundColor(action.owned ? .accentColor : .gray)
-                    if !action.owned {
-                        Image(systemName: "lock.fill")
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundColor(.white)
-                            .padding(6)
-                            .background(Color.black.opacity(0.55))
-                            .clipShape(Circle())
-                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                            .padding(8)
-                    }
-                }
-                .frame(height: 88)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(isEquipped ? Color.accentColor : .clear, lineWidth: 2)
-                )
-
-                Text(action.name)
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundColor(.primary)
-
-                Text(isEquipped ? "装备中" : (action.owned ? "点击装备" : "未拥有"))
-                    .font(.system(size: 11))
-                    .foregroundColor(isEquipped ? .accentColor : .secondary)
-            }
-        }
-        .buttonStyle(.plain)
-    }
-
-    /// Teaser slot — signals more actions are coming (drives the collection loop).
-    private var comingSoonCard: some View {
-        VStack(spacing: 8) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(Color(.systemGray6))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [5]))
-                            .foregroundColor(Color(.systemGray3))
-                    )
-                Image(systemName: "sparkles")
-                    .font(.system(size: 26))
-                    .foregroundColor(.gray)
-            }
-            .frame(height: 88)
-            Text("敬请期待")
-                .font(.system(size: 14, weight: .medium))
-                .foregroundColor(.secondary)
-            Text("更多动作")
-                .font(.system(size: 11))
-                .foregroundColor(.secondary)
+    private func debugLabel(for zone: TapZone) -> String {
+        switch zone {
+        case .head:        return "挠头"
+        case .leftEdge:    return "摸肚子"
+        case .rightEdge:   return "打枪"
+        case .upperMiddle: return "大笑"
+        case .lowerMiddle: return "浮起来"
         }
     }
 }
