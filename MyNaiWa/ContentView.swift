@@ -26,6 +26,8 @@ enum NaiwaClip: String, CaseIterable {
     case head       = "挠头"
     case gun        = "打枪"
     case taiji      = "打太极"
+    case spacesuit  = "太空服"
+    case gatling    = "加特林"
     case laugh      = "肚子和胳膊-大笑"
     case floating   = "腿与脚-浮起来"
     case talkEnter  = "进入"
@@ -37,7 +39,7 @@ enum NaiwaClip: String, CaseIterable {
     var subdirectory: String {
         switch self {
         case .talkEnter, .talkListen, .talkSpeak, .talkExit: return "video/变声模式"
-        case .taiji: return "video/可配动作"
+        case .gun, .taiji, .spacesuit, .gatling: return "video/可配动作"
         default: return "video"
         }
     }
@@ -63,15 +65,18 @@ struct NaiwaAction: Identifiable {
     let name: String
     let clip: NaiwaClip
     let emoji: String       // Apple emoji shown in the floating 动作 panel
-    let owned: Bool         // prototype: everything owned; later: ad/coin/IAP
+    let tier: AssetTier     // 赠送 / 免费 / 礼包 / 隐藏 — drives unlock & uses
 
     static let catalog: [NaiwaAction] = [
-        NaiwaAction(id: "gun",   name: "打枪",   clip: .gun,   emoji: "🔫", owned: true),
-        NaiwaAction(id: "taiji", name: "打太极", clip: .taiji, emoji: "🥋", owned: true),
+        NaiwaAction(id: "taiji",     name: "打太极", clip: .taiji,     emoji: "🥋",  tier: .gift),
+        NaiwaAction(id: "spacesuit", name: "太空服", clip: .spacesuit, emoji: "🧑‍🚀", tier: .free),
+        NaiwaAction(id: "gun",       name: "打枪",   clip: .gun,       emoji: "🔫",  tier: .pack),
+        NaiwaAction(id: "gatling",   name: "加特林", clip: .gatling,   emoji: "💥",  tier: .hidden),
     ]
 
     static func byId(_ id: String) -> NaiwaAction? { catalog.first { $0.id == id } }
-    static let defaultId = "gun"
+    /// Default right-hand action — a 赠送 (∞) one, since 打枪 is now a paid pack.
+    static let defaultId = "taiji"
 }
 
 // MARK: - State machine
@@ -193,6 +198,7 @@ struct NaiwaVoiceProfile: Identifiable {
     let id: String
     let name: String
     let emoji: String               // Apple emoji shown in the floating 音色 panel
+    let tier: AssetTier             // 赠送(原声) / 免费(萝莉音) — drives unlock & uses
     let pitchCents: Float
     let distortion: DistortionPreset
     let distortionMix: Float
@@ -202,11 +208,11 @@ struct NaiwaVoiceProfile: Identifiable {
     let voiceBoost: Bool
 
     static let all: [NaiwaVoiceProfile] = [
-        NaiwaVoiceProfile(id: "naiwa", name: "奶蛙原声", emoji: "🐸",
+        NaiwaVoiceProfile(id: "naiwa", name: "奶蛙原声", emoji: "🐸", tier: .gift,
                           pitchCents: -900, distortion: .none, distortionMix: 0,
                           eqBassGain: -4, eqBassFreq: 210,
                           noiseReduction: true, voiceBoost: false),
-        NaiwaVoiceProfile(id: "loli", name: "萝莉音", emoji: "👧",
+        NaiwaVoiceProfile(id: "loli", name: "萝莉音", emoji: "👧", tier: .free,
                           pitchCents: 700, distortion: .none, distortionMix: 0,
                           eqBassGain: -3, eqBassFreq: 200,
                           noiseReduction: true, voiceBoost: true),
@@ -733,7 +739,7 @@ final class NaiwaPlayer: ObservableObject {
         didSet { UserDefaults.standard.set(equippedActionId, forKey: "naiwa_equippedAction") }
     }
     private var equippedClip: NaiwaClip {
-        NaiwaAction.byId(equippedActionId)?.clip ?? .gun
+        NaiwaAction.byId(equippedActionId)?.clip ?? .taiji
     }
 
     /// KVO tokens kept alive so we can preroll each clip once its item is ready.
@@ -1053,8 +1059,8 @@ final class NaiwaPlayer: ObservableObject {
     /// laugh / floating / running action, but never talk mode. Re-tapping奶蛙's
     /// right arm during it rewinds like a normal equipped action.
     func playAction(_ actionId: String) {
-        guard let action = NaiwaAction.byId(actionId), action.owned,
-              !state.isInTalkMode else { return }
+        // Slice A: no unlock gating yet (comes in the panel-UI slice); just play.
+        guard let action = NaiwaAction.byId(actionId), !state.isInTalkMode else { return }
         state = .action
         interactionRewindZone = .rightEdge
         switchTo(action.clip)
@@ -1214,6 +1220,7 @@ final class NaiwaPlayer: ObservableObject {
 
 struct DebugPanel: View {
     @ObservedObject var voice: NaiwaVoice
+    @ObservedObject var economy: Economy
     @Binding var showHitZones: Bool
     @Environment(\.dismiss) private var dismiss
 
@@ -1224,6 +1231,18 @@ struct DebugPanel: View {
                     Toggle("显示交互区域（红/蓝/绿/紫）", isOn: $showHitZones)
                     Text("勾上后关闭本页，主屏幕会显示 4 个交互区域色块")
                         .font(.caption).foregroundColor(.secondary)
+                }
+
+                Section("经济（调试）") {
+                    HStack {
+                        Text("奶币 🪙 \(economy.coins)")
+                            .font(.system(.body, design: .rounded))
+                        Spacer()
+                        Button("+50") { economy.debugGrant(50) }
+                            .buttonStyle(.bordered)
+                        Button("重置") { economy.debugReset() }
+                            .buttonStyle(.bordered).tint(.red)
+                    }
                 }
 
                 Section("清晰度") {
@@ -1341,6 +1360,7 @@ struct DebugPanel: View {
 
 struct ContentView: View {
     @StateObject private var naiwa = NaiwaPlayer()
+    @StateObject private var economy = Economy()
     @State private var showHitZones = false
     @State private var showDebug = false
     @State private var showSettings = false
@@ -1348,6 +1368,8 @@ struct ContentView: View {
     @State private var voicesPanelOpen = false
     @State private var toast: String?
     @State private var toastTask: Task<Void, Never>?
+    /// Dev A/B clarity test: overlay a standalone 720P clip over the main scene.
+    @State private var showTestVideo = false
 
     /// Hit-zones as explicit rectangles in VIDEO-normalized coords (0-1 within
     /// the 9:16 source frame), NOT screen coords. Taps are mapped back through
@@ -1394,6 +1416,14 @@ struct ContentView: View {
                 NaiwaSurface(view: naiwa.hostView)
                     .ignoresSafeArea()
 
+                // A/B clarity test: overlay a standalone looping clip (奶蛙吃飞船,
+                // 720P) on top of the main scene to eyeball it against the 2K
+                // clips. Toggled from the top-left 🎬 button. Temporary dev tool.
+                if showTestVideo {
+                    LoopingVideoView(resource: "奶蛙吃飞船720P测试", subdirectory: "video")
+                        .ignoresSafeArea()
+                }
+
                 // Full-screen tap layer (ignores safe area) so 浮起来 hit-tests
                 // all the way to the physical bottom edge, including the home-
                 // indicator strip. Below the chrome buttons so they keep tap
@@ -1431,19 +1461,27 @@ struct ContentView: View {
                         .onTapGesture { closePanels() }
                 }
 
-                // Top chrome: dev debug (left) + user settings placeholder (right).
+                // Top chrome: dev tools (left) · 奶币 balance (center) · settings (right).
                 VStack {
-                    HStack {
-                        // Dev-only debug entry — distinct icon so it reads as a
-                        // tool, not a user setting. Gate/hide before shipping.
-                        circleIconButton("ladybug.fill", size: 17) { showDebug = true }
+                    ZStack {
+                        HStack {
+                            // Dev-only tools (gate/hide before shipping): debug
+                            // panel + a 720P/2K clarity A/B toggle.
+                            HStack(spacing: 10) {
+                                circleIconButton("ladybug.fill", size: 17) { showDebug = true }
+                                circleIconButton(showTestVideo ? "film.fill" : "film", size: 17) {
+                                    showTestVideo.toggle()
+                                }
+                            }
                             .padding(.leading, 14)
-                        Spacer()
-                        // User-facing settings.
-                        circleIconButton("line.3.horizontal", size: 19) {
-                            withAnimation(.easeInOut(duration: 0.15)) { showSettings = true }
+                            Spacer()
+                            // User-facing settings.
+                            circleIconButton("line.3.horizontal", size: 19) {
+                                withAnimation(.easeInOut(duration: 0.15)) { showSettings = true }
+                            }
+                            .padding(.trailing, 14)
                         }
-                        .padding(.trailing, 14)
+                        coinPill
                     }
                     .padding(.top, 12)
                     Spacer()
@@ -1530,7 +1568,7 @@ struct ContentView: View {
         }
         .statusBarHidden()
         .sheet(isPresented: $showDebug) {
-            DebugPanel(voice: naiwa.voice, showHitZones: $showHitZones)
+            DebugPanel(voice: naiwa.voice, economy: economy, showHitZones: $showHitZones)
         }
     }
 
@@ -1651,6 +1689,22 @@ struct ContentView: View {
             guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: 0.25)) { toast = nil }
         }
+    }
+
+    /// 奶币 balance pill — top-center, always visible so the earn/spend loop is
+    /// legible. 🪙 + count in a translucent capsule.
+    private var coinPill: some View {
+        HStack(spacing: 5) {
+            Text("🪙").font(.system(size: 14))
+            Text("\(economy.coins)")
+                .font(.system(size: 15, weight: .bold, design: .rounded))
+                .foregroundColor(.white)
+                .contentTransition(.numericText())
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Capsule().fill(Color.black.opacity(0.32)))
+        .animation(.snappy, value: economy.coins)
     }
 
     /// Bottom-corner chrome button (动作 / 音色) — icon-only in a translucent
@@ -1906,6 +1960,52 @@ struct NaiwaSurface: UIViewRepresentable {
     let view: NaiwaHostView
     func makeUIView(context: Context) -> NaiwaHostView { view }
     func updateUIView(_ uiView: NaiwaHostView, context: Context) {}
+}
+
+// MARK: - Standalone looping video (dev clarity test)
+
+/// A self-contained aspect-fill video that loops seamlessly and auto-plays.
+/// Independent of `NaiwaPlayer`'s state machine — used only for the 720P/2K
+/// A/B comparison overlay. `AVPlayerLooper` gives gapless looping.
+struct LoopingVideoView: UIViewRepresentable {
+    let resource: String
+    let subdirectory: String?
+
+    func makeUIView(context: Context) -> PlayerUIView {
+        PlayerUIView(resource: resource, subdirectory: subdirectory)
+    }
+    func updateUIView(_ uiView: PlayerUIView, context: Context) {}
+
+    final class PlayerUIView: UIView {
+        private let queuePlayer = AVQueuePlayer()
+        private let playerLayer = AVPlayerLayer()
+        private var looper: AVPlayerLooper?
+
+        init(resource: String, subdirectory: String?) {
+            super.init(frame: .zero)
+            backgroundColor = .black
+            playerLayer.videoGravity = .resizeAspectFill
+            playerLayer.player = queuePlayer
+            layer.addSublayer(playerLayer)
+
+            let url = Bundle.main.url(forResource: resource, withExtension: "mp4", subdirectory: subdirectory)
+                ?? Bundle.main.url(forResource: resource, withExtension: "mp4")
+            if let url {
+                let item = AVPlayerItem(url: url)
+                looper = AVPlayerLooper(player: queuePlayer, templateItem: item)
+                queuePlayer.isMuted = false
+                queuePlayer.play()
+            } else {
+                print("⚠️ Missing test video: \(resource).mp4")
+            }
+        }
+        required init?(coder: NSCoder) { fatalError("init(coder:) not supported") }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            playerLayer.frame = bounds
+        }
+    }
 }
 
 #Preview {
