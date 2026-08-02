@@ -742,6 +742,12 @@ final class NaiwaPlayer: ObservableObject {
         NaiwaAction.byId(equippedActionId)?.clip ?? .taiji
     }
 
+    /// Fired when the user starts a fresh interaction (zone tap / panel action).
+    /// Drives the daily-task + lifetime interaction counters. Not fired on rewind.
+    var onUserInteraction: (() -> Void)?
+    /// Fired when奶蛙 actually starts speaking back a recording (real speech).
+    var onSpeakStarted: (() -> Void)?
+
     /// KVO tokens kept alive so we can preroll each clip once its item is ready.
     private var prewarmObservers: [NSKeyValueObservation] = []
 
@@ -1052,6 +1058,7 @@ final class NaiwaPlayer: ObservableObject {
         }
         // Remember which zone owns this interaction so re-taps scrub it.
         interactionRewindZone = zone
+        onUserInteraction?()
     }
 
     /// Play a specific action's clip once (from the floating 动作 panel) WITHOUT
@@ -1064,6 +1071,7 @@ final class NaiwaPlayer: ObservableObject {
         state = .action
         interactionRewindZone = .rightEdge
         switchTo(action.clip)
+        onUserInteraction?()
     }
 
     /// Rewind the currently-playing action by `actionRewindStep`, clamped at
@@ -1204,6 +1212,9 @@ final class NaiwaPlayer: ObservableObject {
             switchTo(.talkExit)
             return
         }
+
+        // Real speech is playing back → counts for the 变声 daily task.
+        onSpeakStarted?()
 
         // Fallback: if the audible detector never fires (e.g. a quiet recording
         // under the mixer threshold), switch anyway after 400ms so奶蛙 doesn't
@@ -1393,6 +1404,8 @@ struct ContentView: View {
     @State private var showHitZones = false
     @State private var showDebug = false
     @State private var showSettings = false
+    @State private var showTasks = false
+    @Environment(\.scenePhase) private var scenePhase
     @State private var actionsPanelOpen = false
     @State private var voicesPanelOpen = false
     @State private var toast: String?
@@ -1490,19 +1503,12 @@ struct ContentView: View {
                         .onTapGesture { closePanels() }
                 }
 
-                // Top chrome: dev tools (left) · 奶币 balance (center) · settings (right).
+                // Top chrome: 奶币/任务入口 (left) · dev tools (center) · settings (right).
                 VStack {
                     ZStack {
                         HStack {
-                            // Dev-only tools (gate/hide before shipping): debug
-                            // panel + a 720P/2K clarity A/B toggle.
-                            HStack(spacing: 10) {
-                                circleIconButton("ladybug.fill", size: 17) { showDebug = true }
-                                circleIconButton(showTestVideo ? "film.fill" : "film", size: 17) {
-                                    showTestVideo.toggle()
-                                }
-                            }
-                            .padding(.leading, 14)
+                            coinPill        // tap → 任务中心
+                                .padding(.leading, 14)
                             Spacer()
                             // User-facing settings.
                             circleIconButton("line.3.horizontal", size: 19) {
@@ -1510,7 +1516,14 @@ struct ContentView: View {
                             }
                             .padding(.trailing, 14)
                         }
-                        coinPill
+                        // Dev-only tools (gate/hide before shipping): debug panel
+                        // + a 720P/2K clarity A/B toggle. Centered.
+                        HStack(spacing: 10) {
+                            circleIconButton("ladybug.fill", size: 17) { showDebug = true }
+                            circleIconButton(showTestVideo ? "film.fill" : "film", size: 17) {
+                                showTestVideo.toggle()
+                            }
+                        }
                     }
                     .padding(.top, 12)
                     Spacer()
@@ -1594,6 +1607,16 @@ struct ContentView: View {
                     .transition(.opacity)
                 }
 
+                // Task center — same top-most instant overlay as settings.
+                if showTasks {
+                    NavigationStack {
+                        TaskCenterView(economy: economy, onClose: {
+                            withAnimation(.easeInOut(duration: 0.15)) { showTasks = false }
+                        })
+                    }
+                    .transition(.opacity)
+                }
+
                 // Unlock / refill / founder dialog — modal, dimmed backdrop.
                 if let dialog = assetDialog {
                     Color.black.opacity(0.38)
@@ -1608,6 +1631,31 @@ struct ContentView: View {
         .statusBarHidden()
         .sheet(isPresented: $showDebug) {
             DebugPanel(voice: naiwa.voice, economy: economy, showHitZones: $showHitZones)
+        }
+        .onAppear {
+            // Route player events into the daily-task counters (idempotent).
+            naiwa.onUserInteraction = { economy.recordInteraction() }
+            naiwa.onSpeakStarted = { economy.recordTalk() }
+            economy.beginCompanionSession()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .active:
+                economy.rolloverIfNeeded()
+                economy.beginCompanionSession()
+            case .inactive, .background:
+                economy.endCompanionSession()
+            @unknown default:
+                break
+            }
+        }
+        .task {
+            // Periodic companion flush so the 5-minute task can complete while
+            // the user simply keeps the app open watching奶蛙.
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 20_000_000_000)
+                economy.flushCompanion()
+            }
         }
     }
 
@@ -1926,19 +1974,32 @@ struct ContentView: View {
         }
     }
 
-    /// 奶币 balance pill — top-center, always visible so the earn/spend loop is
-    /// legible. 🪙 + count in a translucent capsule.
+    /// 奶币 balance pill (top-left) — tap opens the 任务中心. A red dot signals
+    /// tasks that are done but unclaimed.
     private var coinPill: some View {
-        HStack(spacing: 5) {
-            Text("🪙").font(.system(size: 14))
-            Text("\(economy.coins)")
-                .font(.system(size: 15, weight: .bold, design: .rounded))
-                .foregroundColor(.white)
-                .contentTransition(.numericText())
+        Button {
+            economy.flushCompanion()
+            withAnimation(.easeInOut(duration: 0.15)) { showTasks = true }
+        } label: {
+            HStack(spacing: 5) {
+                Text("🪙").font(.system(size: 14))
+                Text("\(economy.coins)")
+                    .font(.system(size: 15, weight: .bold, design: .rounded))
+                    .foregroundColor(.white)
+                    .contentTransition(.numericText())
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(Capsule().fill(Color.black.opacity(0.32)))
+            .overlay(alignment: .topTrailing) {
+                if economy.claimableTaskCount > 0 {
+                    Circle().fill(Color.red)
+                        .frame(width: 9, height: 9)
+                        .overlay(Circle().stroke(Color.white.opacity(0.85), lineWidth: 1))
+                        .offset(x: 3, y: -3)
+                }
+            }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
-        .background(Capsule().fill(Color.black.opacity(0.32)))
         .animation(.snappy, value: economy.coins)
     }
 

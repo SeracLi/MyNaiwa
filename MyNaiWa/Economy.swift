@@ -50,6 +50,26 @@ struct AssetProgress: Codable, Equatable {
     var discovered: Bool = false    // hidden: has been triggered/seen
 }
 
+// MARK: - Daily tasks
+
+enum TaskUnit { case count, seconds }
+
+/// A daily task. Progress resets each local calendar day; reward is claimed once.
+struct DailyTask: Identifiable {
+    let id: String
+    let emoji: String
+    let title: String
+    let target: Int
+    let reward: Int
+    let unit: TaskUnit
+
+    static let all: [DailyTask] = [
+        DailyTask(id: "interact",  emoji: "👆",  title: "和奶蛙互动一次",     target: 1,   reward: 10, unit: .count),
+        DailyTask(id: "companion", emoji: "⏱️", title: "陪伴奶蛙满 5 分钟",  target: 300, reward: 25, unit: .seconds),
+        DailyTask(id: "talk",      emoji: "🎙️", title: "用变声和奶蛙说句话", target: 1,   reward: 15, unit: .count),
+    ]
+}
+
 // MARK: - Economy store
 
 @MainActor
@@ -65,6 +85,19 @@ final class Economy: ObservableObject {
 
     @Published private(set) var coins: Int = 0
     @Published private(set) var assets: [String: AssetProgress] = [:]
+
+    // Daily tasks (reset each local day). Published so the task center + coin-pill
+    // badge update live.
+    @Published private(set) var taskProgress: [String: Int] = [:]
+    @Published private(set) var taskClaimed: [String: Bool] = [:]
+    private var tasksDay: String = ""
+
+    /// Lifetime counters — fuel the 加特林 hidden trigger (Slice E). Not per-day.
+    private(set) var lifetimeInteractions: Int = 0
+    private(set) var activeDays: Int = 0
+
+    /// In-memory only: when the current foreground "companion" session started.
+    private var companionStart: Date?
 
     private var updatedAt: Double = 0
     private let defaults = UserDefaults.standard
@@ -87,6 +120,7 @@ final class Economy: ObservableObject {
             updatedAt = Date().timeIntervalSince1970
             persist()
         }
+        rolloverIfNeeded()
 
         cloudObserver = NotificationCenter.default.addObserver(
             forName: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
@@ -161,6 +195,85 @@ final class Economy: ObservableObject {
         mutate(id) { $0.discovered = true; $0.unlocked = true; $0.uses += Self.freeUnlockUses }
     }
 
+    // MARK: Daily tasks
+
+    /// Reset per-day task state when the calendar day changes; bump the lifetime
+    /// active-day counter (used by the 加特林 gate).
+    func rolloverIfNeeded() {
+        let today = Self.todayString()
+        guard tasksDay != today else { return }
+        tasksDay = today
+        taskProgress = [:]
+        taskClaimed = [:]
+        activeDays += 1
+        bump()
+    }
+
+    func taskValue(_ id: String) -> Int { taskProgress[id] ?? 0 }
+    func isTaskComplete(_ t: DailyTask) -> Bool { taskValue(t.id) >= t.target }
+    func isTaskClaimed(_ t: DailyTask) -> Bool { taskClaimed[t.id] ?? false }
+
+    /// Number of completed-but-unclaimed tasks — drives the coin-pill badge.
+    var claimableTaskCount: Int {
+        DailyTask.all.filter { isTaskComplete($0) && !isTaskClaimed($0) }.count
+    }
+
+    @discardableResult
+    func claimTask(_ t: DailyTask) -> Bool {
+        rolloverIfNeeded()
+        guard isTaskComplete(t), !isTaskClaimed(t) else { return false }
+        taskClaimed[t.id] = true
+        earn(t.reward)   // earn() bumps + persists
+        return true
+    }
+
+    /// One user interaction happened (tap/action) — advances the daily task AND
+    /// the lifetime counter for the hidden trigger.
+    func recordInteraction() {
+        rolloverIfNeeded()
+        lifetimeInteractions += 1
+        if taskValue("interact") < 1 { taskProgress["interact"] = 1 }
+        bump()
+    }
+
+    /// A talk playback (奶蛙 actually spoke) happened.
+    func recordTalk() {
+        rolloverIfNeeded()
+        if taskValue("talk") < 1 { taskProgress["talk"] = 1 }
+        bump()
+    }
+
+    // Companion (foreground time) accrual. Start on scene-active, flush on a
+    // timer + on scene-inactive, so the 5-minute task can complete in-session.
+    func beginCompanionSession() {
+        rolloverIfNeeded()
+        companionStart = Date()
+    }
+
+    func flushCompanion() {
+        guard let start = companionStart else { return }
+        rolloverIfNeeded()
+        let elapsed = Int(Date().timeIntervalSince(start))
+        companionStart = Date()
+        guard elapsed > 0 else { return }
+        let cur = taskValue("companion")
+        taskProgress["companion"] = min(cur + elapsed, 24 * 3600)
+        bump()
+    }
+
+    func endCompanionSession() {
+        flushCompanion()
+        companionStart = nil
+    }
+
+    private static let dayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f
+    }()
+    static func todayString() -> String { dayFormatter.string(from: Date()) }
+
     // MARK: Debug (dev-only)
 
     func debugGrant(_ n: Int) { earn(n) }
@@ -168,7 +281,12 @@ final class Economy: ObservableObject {
     func debugReset() {
         coins = Self.startingCoins
         assets = [:]
-        bump()
+        taskProgress = [:]
+        taskClaimed = [:]
+        lifetimeInteractions = 0
+        activeDays = 0
+        tasksDay = ""
+        rolloverIfNeeded()   // → tasksDay=today, activeDays=1, persists
     }
 
     // MARK: Persistence
@@ -186,7 +304,9 @@ final class Economy: ObservableObject {
     }
 
     private func persist() {
-        let snap = Snapshot(coins: coins, assets: assets, updatedAt: updatedAt)
+        let snap = Snapshot(coins: coins, assets: assets, updatedAt: updatedAt,
+                            tasksDay: tasksDay, taskProgress: taskProgress, taskClaimed: taskClaimed,
+                            lifetimeInteractions: lifetimeInteractions, activeDays: activeDays)
         guard let data = try? JSONEncoder().encode(snap) else { return }
         defaults.set(data, forKey: key)
         cloud.set(data, forKey: key)
@@ -201,6 +321,11 @@ final class Economy: ObservableObject {
         coins = s.coins
         assets = s.assets
         updatedAt = s.updatedAt
+        tasksDay = s.tasksDay ?? ""
+        taskProgress = s.taskProgress ?? [:]
+        taskClaimed = s.taskClaimed ?? [:]
+        lifetimeInteractions = s.lifetimeInteractions ?? 0
+        activeDays = s.activeDays ?? 0
     }
 
     private static func decode(_ data: Data?) -> Snapshot? {
@@ -208,9 +333,15 @@ final class Economy: ObservableObject {
         return try? JSONDecoder().decode(Snapshot.self, from: data)
     }
 
+    // New fields are optional so snapshots written by earlier slices still decode.
     private struct Snapshot: Codable {
         var coins: Int
         var assets: [String: AssetProgress]
         var updatedAt: Double
+        var tasksDay: String?
+        var taskProgress: [String: Int]?
+        var taskClaimed: [String: Bool]?
+        var lifetimeInteractions: Int?
+        var activeDays: Int?
     }
 }
