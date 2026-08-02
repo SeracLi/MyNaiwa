@@ -1356,11 +1356,40 @@ struct DebugPanel: View {
     }
 }
 
+// MARK: - Panel item badge & unlock dialog
+
+/// Corner badge on a floating-panel item, reflecting its economy state.
+enum ItemBadge: Equatable {
+    case none
+    case infinite          // ♾️ — gift or owned pack
+    case uses(Int)         // ×N remaining (metered)
+    case lockCoins(Int)    // 🔒 + 奶币 cost (免费 locked)
+    case lockPack          // ¥ — founder pack
+}
+
+/// Modal shown when a locked / used-up / pack asset is tapped.
+enum AssetDialog: Identifiable {
+    case unlock(id: String, name: String, emoji: String)    // 免费 locked → pay coins
+    case refill(id: String, name: String, emoji: String)    // uses 0 → buy more
+    case founder(id: String, name: String, emoji: String)   // 打枪 pack → ¥ (IAP in slice D)
+    case notEnough(needed: Int)
+
+    var id: String {
+        switch self {
+        case .unlock(let i, _, _):  return "unlock-\(i)"
+        case .refill(let i, _, _):  return "refill-\(i)"
+        case .founder(let i, _, _): return "founder-\(i)"
+        case .notEnough:            return "notEnough"
+        }
+    }
+}
+
 // MARK: - Main view
 
 struct ContentView: View {
     @StateObject private var naiwa = NaiwaPlayer()
     @StateObject private var economy = Economy()
+    @State private var assetDialog: AssetDialog?
     @State private var showHitZones = false
     @State private var showDebug = false
     @State private var showSettings = false
@@ -1564,6 +1593,16 @@ struct ContentView: View {
                     }
                     .transition(.opacity)
                 }
+
+                // Unlock / refill / founder dialog — modal, dimmed backdrop.
+                if let dialog = assetDialog {
+                    Color.black.opacity(0.38)
+                        .ignoresSafeArea()
+                        .transition(.opacity)
+                        .onTapGesture { dismissDialog() }
+                    assetDialogCard(dialog)
+                        .transition(.scale(scale: 0.85).combined(with: .opacity))
+                }
             }
         }
         .statusBarHidden()
@@ -1575,18 +1614,16 @@ struct ContentView: View {
     // MARK: Floating panels (动作 / 音色)
 
     private var actionPanel: some View {
-        floatingPanel(caption: "点击播放 · 长按设为右手动作") {
-            ForEach(NaiwaAction.catalog) { action in
+        // Hidden-tier assets (加特林) only appear once discovered.
+        let items = NaiwaAction.catalog.filter { economy.isVisible($0.id, tier: $0.tier) }
+        return floatingPanel(caption: "点击播放 · 长按无限动作设为右手") {
+            ForEach(items) { action in
                 floatingItem(emoji: action.emoji,
                              label: action.name,
                              selected: action.id == naiwa.equippedActionId,
-                             onTap: { naiwa.playAction(action.id); closePanels() },
-                             onLongPress: {
-                                 naiwa.equippedActionId = action.id
-                                 impact()
-                                 closePanels()
-                                 showToast("\(action.emoji) \(action.name) 已设为右手动作")
-                             })
+                             badge: actionBadge(action),
+                             onTap: { handleActionTap(action) },
+                             onLongPress: { handleActionLongPress(action) })
             }
         }
     }
@@ -1597,13 +1634,181 @@ struct ContentView: View {
                 floatingItem(emoji: profile.emoji,
                              label: profile.name,
                              selected: profile.id == naiwa.voice.selectedVoiceId,
-                             onTap: {
-                                 naiwa.voice.applyVoiceProfile(profile)
-                                 impact()
-                                 closePanels()
-                             })
+                             badge: voiceBadge(profile),
+                             onTap: { handleVoiceTap(profile) })
             }
         }
+    }
+
+    // MARK: Panel tap handling (economy-gated)
+
+    private func handleActionTap(_ a: NaiwaAction) {
+        let p = economy.progress(a.id)
+        switch a.tier {
+        case .gift:
+            playAndClose(a)
+        case .free:
+            if !p.unlocked {
+                presentDialog(.unlock(id: a.id, name: a.name, emoji: a.emoji))
+            } else if p.uses > 0 {
+                economy.consumeUse(a.id); playAndClose(a)
+            } else {
+                presentDialog(.refill(id: a.id, name: a.name, emoji: a.emoji))
+            }
+        case .pack:
+            if p.infinite {
+                playAndClose(a)
+            } else if p.previewsUsed < Economy.packPreviewLimit {
+                economy.consumePreview(a.id)
+                playAndClose(a)
+                showToast("创始人礼包试玩 \(economy.progress(a.id).previewsUsed)/\(Economy.packPreviewLimit)")
+            } else {
+                presentDialog(.founder(id: a.id, name: a.name, emoji: a.emoji))
+            }
+        case .hidden:
+            if p.uses > 0 {
+                economy.consumeUse(a.id); playAndClose(a)
+            } else {
+                presentDialog(.refill(id: a.id, name: a.name, emoji: a.emoji))
+            }
+        }
+    }
+
+    /// Long-press equips to the right hand — only ∞ actions are equippable.
+    private func handleActionLongPress(_ a: NaiwaAction) {
+        guard isInfiniteAction(a) else {
+            impact()
+            showToast("无限次的动作才能装备到右手")
+            return
+        }
+        naiwa.equippedActionId = a.id
+        impact()
+        closePanels()
+        showToast("\(a.emoji) \(a.name) 已设为右手动作")
+    }
+
+    private func handleVoiceTap(_ v: NaiwaVoiceProfile) {
+        // 免费 voice still locked → unlock dialog. Otherwise just select it.
+        // (Per-use metering of voices is deferred to the talk-flow slice.)
+        if v.tier == .free, !economy.progress(v.id).unlocked {
+            presentDialog(.unlock(id: v.id, name: v.name, emoji: v.emoji))
+        } else {
+            naiwa.voice.applyVoiceProfile(v)
+            impact()
+            closePanels()
+        }
+    }
+
+    private func playAndClose(_ a: NaiwaAction) {
+        naiwa.playAction(a.id)
+        closePanels()
+    }
+
+    private func isInfiniteAction(_ a: NaiwaAction) -> Bool {
+        switch a.tier {
+        case .gift: return true
+        case .pack: return economy.progress(a.id).infinite
+        default:    return false
+        }
+    }
+
+    private func actionBadge(_ a: NaiwaAction) -> ItemBadge {
+        let p = economy.progress(a.id)
+        switch a.tier {
+        case .gift:   return .infinite
+        case .free:   return p.unlocked ? (p.infinite ? .infinite : .uses(p.uses)) : .lockCoins(Economy.freeUnlockCost)
+        case .pack:   return p.infinite ? .infinite : .lockPack
+        case .hidden: return .uses(p.uses)
+        }
+    }
+
+    private func voiceBadge(_ v: NaiwaVoiceProfile) -> ItemBadge {
+        switch v.tier {
+        case .free: return economy.progress(v.id).unlocked ? .none : .lockCoins(Economy.freeUnlockCost)
+        default:    return .none
+        }
+    }
+
+    // MARK: Unlock dialog
+
+    private func presentDialog(_ d: AssetDialog) {
+        closePanels()
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) { assetDialog = d }
+    }
+
+    private func dismissDialog() {
+        withAnimation(.easeOut(duration: 0.18)) { assetDialog = nil }
+    }
+
+    /// After a successful unlock/refill, immediately use the asset: actions play
+    /// (consuming one use), voices apply. Keeps the flow one-tap.
+    private func postUnlockUse(_ id: String) {
+        if NaiwaAction.byId(id) != nil {
+            economy.consumeUse(id)
+            naiwa.playAction(id)
+        } else if let v = NaiwaVoiceProfile.all.first(where: { $0.id == id }) {
+            naiwa.voice.applyVoiceProfile(v)
+        }
+    }
+
+    @ViewBuilder
+    private func assetDialogCard(_ d: AssetDialog) -> some View {
+        switch d {
+        case .unlock(let id, let name, let emoji):
+            dialogShell(emoji: emoji, title: "解锁 \(name)",
+                        message: "花 \(Economy.freeUnlockCost) 🪙 解锁，先送你 \(Economy.freeUnlockUses) 次",
+                        primary: "花 \(Economy.freeUnlockCost) 🪙 解锁", secondary: "以后再说") {
+                if economy.unlockFree(id) { postUnlockUse(id); dismissDialog() }
+                else { withAnimation { assetDialog = .notEnough(needed: Economy.freeUnlockCost) } }
+            }
+        case .refill(let id, let name, let emoji):
+            dialogShell(emoji: emoji, title: "\(name) 次数用完了",
+                        message: "花 \(Economy.refillCost) 🪙 再来 \(Economy.refillUses) 次",
+                        primary: "花 \(Economy.refillCost) 🪙 购买", secondary: "以后再说") {
+                if economy.refill(id) { postUnlockUse(id); dismissDialog() }
+                else { withAnimation { assetDialog = .notEnough(needed: Economy.refillCost) } }
+            }
+        case .founder(_, let name, let emoji):
+            dialogShell(emoji: emoji, title: "创始人限定 · \(name)",
+                        message: "创始人礼包 ¥2，永久无限次。内购即将开放。",
+                        primary: "知道了", secondary: nil) { dismissDialog() }
+        case .notEnough(let needed):
+            dialogShell(emoji: "🙈", title: "奶币不够啦",
+                        message: "还差一点，先陪奶蛙多玩会儿赚奶币吧（需要 \(needed) 🪙）",
+                        primary: "好的", secondary: nil) { dismissDialog() }
+        }
+    }
+
+    private func dialogShell(emoji: String, title: String, message: String,
+                             primary: String, secondary: String?,
+                             onPrimary: @escaping () -> Void) -> some View {
+        VStack(spacing: 14) {
+            Text(emoji).font(.system(size: 44))
+            Text(title).font(.system(size: 18, weight: .bold)).foregroundColor(.primary)
+            Text(message).font(.system(size: 14)).foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+            VStack(spacing: 8) {
+                Button(action: onPrimary) {
+                    Text(primary).font(.system(size: 16, weight: .semibold))
+                        .frame(maxWidth: .infinity).padding(.vertical, 12)
+                        .background(Color.accentColor).foregroundColor(.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                }
+                if let secondary {
+                    Button(action: dismissDialog) {
+                        Text(secondary).font(.system(size: 15))
+                            .frame(maxWidth: .infinity).padding(.vertical, 10)
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+            .padding(.top, 2)
+        }
+        .padding(20)
+        .frame(width: 284)
+        .background(RoundedRectangle(cornerRadius: 24, style: .continuous).fill(.regularMaterial))
+        .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
+        .shadow(color: .black.opacity(0.3), radius: 24, y: 10)
     }
 
     /// Rounded frosted card holding a row of items + a caption. Shared by both
@@ -1628,9 +1833,10 @@ struct ContentView: View {
         .shadow(color: .black.opacity(0.28), radius: 16, y: 8)
     }
 
-    /// One selectable item chip (emoji over label). Tap fires `onTap`; an
-    /// optional long-press fires `onLongPress` (used by 动作 to equip).
+    /// One selectable item chip (emoji over label + a state badge). Tap fires
+    /// `onTap`; an optional long-press fires `onLongPress` (used by 动作 to equip).
     private func floatingItem(emoji: String, label: String, selected: Bool,
+                              badge: ItemBadge,
                               onTap: @escaping () -> Void,
                               onLongPress: (() -> Void)? = nil) -> some View {
         VStack(spacing: 4) {
@@ -1648,9 +1854,38 @@ struct ContentView: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .stroke(selected ? Color.accentColor : .clear, lineWidth: 2)
         )
+        .overlay(alignment: .topTrailing) { badgeView(badge) }
         .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .onTapGesture { onTap() }
         .onLongPressGesture(minimumDuration: 0.35) { onLongPress?() }
+    }
+
+    @ViewBuilder
+    private func badgeView(_ badge: ItemBadge) -> some View {
+        switch badge {
+        case .none:
+            EmptyView()
+        case .infinite:
+            badgeLabel("∞", bg: Color(red: 0.20, green: 0.72, blue: 0.40))
+        case .uses(let n):
+            badgeLabel("×\(n)", bg: n > 0 ? Color(red: 0.20, green: 0.52, blue: 0.95)
+                                          : Color.gray.opacity(0.9))
+        case .lockCoins(let c):
+            badgeLabel("🔒\(c)", bg: Color(red: 0.95, green: 0.6, blue: 0.15))
+        case .lockPack:
+            badgeLabel("¥", bg: Color(red: 0.95, green: 0.35, blue: 0.55))
+        }
+    }
+
+    private func badgeLabel(_ text: String, bg: Color) -> some View {
+        Text(text)
+            .font(.system(size: 10, weight: .heavy))
+            .foregroundColor(.white)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(bg))
+            .overlay(Capsule().stroke(Color.white.opacity(0.5), lineWidth: 0.5))
+            .offset(x: 7, y: -7)
     }
 
     private func toggleActionsPanel() {
