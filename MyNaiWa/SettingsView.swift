@@ -31,12 +31,14 @@ struct ShareSheet: UIViewControllerRepresentable {
 // MARK: - Settings
 
 struct SettingsView: View {
+    @ObservedObject var store: StoreManager
     /// Called by the back button. Passed in (rather than using `\.dismiss`) so
     /// the host can show/hide the page instantly instead of the sheet slide.
     let onClose: () -> Void
 
     @Environment(\.horizontalSizeClass) private var hSizeClass
     @State private var showShareSheet = false
+    @State private var showTipThanks = false
 
     /// 奶蛙时代's App Store id.
     private static let appStoreId = "6796403986"
@@ -62,6 +64,22 @@ struct SettingsView: View {
                         // FAQ
                         settingsRow(emoji: "🤔", title: "常见疑问解答") {
                             openURL("https://windream.super.site/to-the-moon/questions")
+                        }
+
+                        divider
+
+                        divider
+
+                        // Tip + restore
+                        settingsRow(emoji: "🧋", title: "请奶蛙喝奶茶") {
+                            Task {
+                                if await store.purchase(StoreManager.ProductID.milkTea) {
+                                    showTipThanks = true
+                                }
+                            }
+                        }
+                        settingsRow(emoji: "🔄", title: "恢复购买") {
+                            Task { await store.restore() }
                         }
 
                         divider
@@ -107,6 +125,11 @@ struct SettingsView: View {
         }
         .sheet(isPresented: $showShareSheet) {
             ShareSheet(items: [URL(string: Self.appStoreURL)!])
+        }
+        .alert("谢谢你的奶茶 🧋", isPresented: $showTipThanks) {
+            Button("不客气~", role: .cancel) {}
+        } message: {
+            Text("奶蛙收到啦，抱抱你！你的支持是它穿越更多时代的动力 💛")
         }
     }
 
@@ -226,6 +249,6 @@ struct SettingsView: View {
 
 #Preview {
     NavigationStack {
-        SettingsView(onClose: {})
+        SettingsView(store: StoreManager(), onClose: {})
     }
 }

@@ -22,10 +22,13 @@ struct TaskCenterView: View {
                 VStack(spacing: 0) {
                     // Balance header
                     VStack(spacing: 6) {
-                        Text("🪙 \(economy.coins)")
-                            .font(.system(size: 34, weight: .bold, design: .rounded))
-                            .foregroundColor(.black)
-                            .contentTransition(.numericText())
+                        HStack(spacing: 8) {
+                            Image("奶币").resizable().scaledToFit().frame(width: 30, height: 30)
+                            Text("\(economy.coins)")
+                                .font(.system(size: 34, weight: .bold, design: .rounded))
+                                .foregroundColor(.black)
+                                .contentTransition(.numericText())
+                        }
                         Text("完成任务赚奶币，解锁更多动作和音色")
                             .font(.system(size: 13))
                             .foregroundColor(.gray)
@@ -81,9 +84,12 @@ struct TaskCenterView: View {
                 Text(task.title)
                     .font(.system(size: 16, weight: .medium))
                     .foregroundColor(.black)
-                Text("+\(task.reward) 🪙")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(Color(red: 0.95, green: 0.6, blue: 0.15))
+                HStack(spacing: 3) {
+                    Text("+\(task.reward)")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(Color(red: 0.95, green: 0.6, blue: 0.15))
+                    Image("奶币").resizable().scaledToFit().frame(width: 12, height: 12)
+                }
             }
             Spacer()
             claimButton(task, complete: complete, claimed: claimed)

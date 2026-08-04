@@ -16,18 +16,20 @@ import Combine
 /// How an asset is gated. Body-tap reactions (自带) aren't modeled here — they're
 /// always-free zone reactions handled directly by the player.
 enum AssetTier: String, Codable {
-    case gift     // 赠送 — infinite, free, shown
-    case free     // 免费 — locked; unlock 50→+5 uses; refill 100→+10
-    case pack     // 礼包 — founder ¥ IAP → infinite; before buy: 2 free previews
-    case hidden   // 隐藏 — not shown until triggered; on trigger +5 uses; then 100/10
+    case gift        // 赠送 — infinite, free, shown
+    case free        // 免费 — locked; unlock 50→+5 uses; refill 100→+10
+    case pack        // 礼包 — founder ¥ IAP → infinite; before buy: 2 free previews
+    case hidden      // 隐藏 — not shown until triggered; on trigger +5 uses; then 100/10
+    case unlockable  // 一次性买断 — locked; pay coins once → infinite forever (音色)
 
     /// Can an asset with this tier + progress be played right now?
     func isPlayable(_ p: AssetProgress) -> Bool {
         switch self {
-        case .gift:   return true
-        case .free:   return p.unlocked && (p.infinite || p.uses > 0)
-        case .pack:   return p.infinite || p.previewsUsed < Economy.packPreviewLimit
-        case .hidden: return p.discovered && (p.infinite || p.uses > 0)
+        case .gift:       return true
+        case .free:       return p.unlocked && (p.infinite || p.uses > 0)
+        case .pack:       return p.infinite || p.previewsUsed < Economy.packPreviewLimit
+        case .hidden:     return p.discovered && (p.infinite || p.uses > 0)
+        case .unlockable: return p.unlocked
         }
     }
 
@@ -83,6 +85,16 @@ final class Economy: ObservableObject {
     static let refillUses      = 10
     static let packPreviewLimit = 2
 
+    // 加特林 hidden trigger: must clear the gate (≥40 lifetime interactions AND
+    // ≥2 distinct active days) before any roll; then each interaction rolls with
+    // a pity ramp so heavy players are guaranteed to eventually get it.
+    static let gatlingGateInteractions = 40
+    static let gatlingGateDays  = 2
+    static let gatlingBaseProb  = 0.04
+    static let gatlingPityStep  = 0.015
+    static let gatlingProbCap   = 0.20
+    static let gatlingId = "gatling"
+
     @Published private(set) var coins: Int = 0
     @Published private(set) var assets: [String: AssetProgress] = [:]
 
@@ -92,9 +104,14 @@ final class Economy: ObservableObject {
     @Published private(set) var taskClaimed: [String: Bool] = [:]
     private var tasksDay: String = ""
 
-    /// Lifetime counters — fuel the 加特林 hidden trigger (Slice E). Not per-day.
+    /// Lifetime counters — fuel the 加特林 hidden trigger. Not per-day.
     private(set) var lifetimeInteractions: Int = 0
     private(set) var activeDays: Int = 0
+    /// Consecutive 加特林 rolls that missed (pity ramp). Persisted.
+    private(set) var gatlingMiss: Int = 0
+    /// One-shot flag: 加特林 was just discovered → show the celebration popup.
+    /// Transient (not persisted).
+    @Published var justDiscoveredGatling = false
 
     /// In-memory only: when the current foreground "companion" session started.
     private var companionStart: Date?
@@ -167,6 +184,14 @@ final class Economy: ObservableObject {
         return true
     }
 
+    /// 一次性买断（音色）：pay the unlock cost once → owned forever (infinite).
+    @discardableResult
+    func unlockPermanent(_ id: String) -> Bool {
+        guard spend(Self.freeUnlockCost) else { return false }
+        mutate(id) { $0.unlocked = true; $0.infinite = true }
+        return true
+    }
+
     /// Refill an already-unlocked metered asset: pay 100, +10 uses.
     @discardableResult
     func refill(_ id: String) -> Bool {
@@ -233,8 +258,27 @@ final class Economy: ObservableObject {
         rolloverIfNeeded()
         lifetimeInteractions += 1
         if taskValue("interact") < 1 { taskProgress["interact"] = 1 }
+        rollGatling()
         bump()
     }
+
+    /// Roll for the 加特林 hidden drop on each interaction, once past the gate.
+    private func rollGatling() {
+        guard !progress(Self.gatlingId).discovered,
+              lifetimeInteractions >= Self.gatlingGateInteractions,
+              activeDays >= Self.gatlingGateDays else { return }
+        let p = min(Self.gatlingProbCap,
+                    Self.gatlingBaseProb + Self.gatlingPityStep * Double(gatlingMiss))
+        if Double.random(in: 0..<1) < p {
+            discoverHidden(Self.gatlingId)   // reveal + 5 uses (bumps)
+            gatlingMiss = 0
+            justDiscoveredGatling = true
+        } else {
+            gatlingMiss += 1
+        }
+    }
+
+    func clearGatlingCelebration() { justDiscoveredGatling = false }
 
     /// A talk playback (奶蛙 actually spoke) happened.
     func recordTalk() {
@@ -285,8 +329,27 @@ final class Economy: ObservableObject {
         taskClaimed = [:]
         lifetimeInteractions = 0
         activeDays = 0
+        gatlingMiss = 0
+        justDiscoveredGatling = false
         tasksDay = ""
         rolloverIfNeeded()   // → tasksDay=today, activeDays=1, persists
+    }
+
+    /// Force the 加特林 discovery (+ celebration popup) for UI tuning.
+    func debugTriggerGatling() {
+        discoverHidden(Self.gatlingId)
+        gatlingMiss = 0
+        justDiscoveredGatling = true
+    }
+
+    /// Back to the "never found 加特林" state (also pulls counters below the
+    /// gate so it won't instantly re-roll while you inspect the UI).
+    func debugResetGatling() {
+        assets[Self.gatlingId] = AssetProgress()
+        gatlingMiss = 0
+        lifetimeInteractions = 0
+        justDiscoveredGatling = false
+        bump()
     }
 
     // MARK: Persistence
@@ -306,7 +369,8 @@ final class Economy: ObservableObject {
     private func persist() {
         let snap = Snapshot(coins: coins, assets: assets, updatedAt: updatedAt,
                             tasksDay: tasksDay, taskProgress: taskProgress, taskClaimed: taskClaimed,
-                            lifetimeInteractions: lifetimeInteractions, activeDays: activeDays)
+                            lifetimeInteractions: lifetimeInteractions, activeDays: activeDays,
+                            gatlingMiss: gatlingMiss)
         guard let data = try? JSONEncoder().encode(snap) else { return }
         defaults.set(data, forKey: key)
         cloud.set(data, forKey: key)
@@ -326,6 +390,7 @@ final class Economy: ObservableObject {
         taskClaimed = s.taskClaimed ?? [:]
         lifetimeInteractions = s.lifetimeInteractions ?? 0
         activeDays = s.activeDays ?? 0
+        gatlingMiss = s.gatlingMiss ?? 0
     }
 
     private static func decode(_ data: Data?) -> Snapshot? {
@@ -343,5 +408,6 @@ final class Economy: ObservableObject {
         var taskClaimed: [String: Bool]?
         var lifetimeInteractions: Int?
         var activeDays: Int?
+        var gatlingMiss: Int?
     }
 }

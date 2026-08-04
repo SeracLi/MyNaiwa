@@ -212,7 +212,7 @@ struct NaiwaVoiceProfile: Identifiable {
                           pitchCents: -900, distortion: .none, distortionMix: 0,
                           eqBassGain: -4, eqBassFreq: 210,
                           noiseReduction: true, voiceBoost: false),
-        NaiwaVoiceProfile(id: "loli", name: "萝莉音", emoji: "👧", tier: .free,
+        NaiwaVoiceProfile(id: "loli", name: "萝莉音", emoji: "👧", tier: .unlockable,
                           pitchCents: 700, distortion: .none, distortionMix: 0,
                           eqBassGain: -3, eqBassFreq: 200,
                           noiseReduction: true, voiceBoost: true),
@@ -1246,7 +1246,7 @@ struct DebugPanel: View {
 
                 Section("经济（调试）") {
                     HStack {
-                        Text("奶币 🪙 \(economy.coins)")
+                        Text("奶币 \(economy.coins)")
                             .font(.system(.body, design: .rounded))
                         Spacer()
                         Button("+50") { economy.debugGrant(50) }
@@ -1254,6 +1254,20 @@ struct DebugPanel: View {
                         Button("重置") { economy.debugReset() }
                             .buttonStyle(.bordered).tint(.red)
                     }
+                }
+
+                Section("加特林（调试）") {
+                    HStack {
+                        Text(economy.progress("gatling").discovered ? "状态：已获得" : "状态：未获得")
+                            .font(.footnote).foregroundColor(.secondary)
+                        Spacer()
+                        Button("触发") { economy.debugTriggerGatling(); dismiss() }
+                            .buttonStyle(.bordered)
+                        Button("重置") { economy.debugResetGatling() }
+                            .buttonStyle(.bordered).tint(.red)
+                    }
+                    Text("触发后会关闭本页，主屏出现「捡到加特林」弹窗")
+                        .font(.caption).foregroundColor(.secondary)
                 }
 
                 Section("清晰度") {
@@ -1380,17 +1394,19 @@ enum ItemBadge: Equatable {
 
 /// Modal shown when a locked / used-up / pack asset is tapped.
 enum AssetDialog: Identifiable {
-    case unlock(id: String, name: String, emoji: String)    // 免费 locked → pay coins
-    case refill(id: String, name: String, emoji: String)    // uses 0 → buy more
-    case founder(id: String, name: String, emoji: String)   // 打枪 pack → ¥ (IAP in slice D)
+    case unlock(id: String, name: String, emoji: String)          // 免费 locked → pay coins (metered)
+    case unlockPermanent(id: String, name: String, emoji: String) // 一次性买断 → pay once, forever
+    case refill(id: String, name: String, emoji: String)          // uses 0 → buy more
+    case founder(id: String, name: String, emoji: String)         // 打枪 pack → ¥
     case notEnough(needed: Int)
 
     var id: String {
         switch self {
-        case .unlock(let i, _, _):  return "unlock-\(i)"
-        case .refill(let i, _, _):  return "refill-\(i)"
-        case .founder(let i, _, _): return "founder-\(i)"
-        case .notEnough:            return "notEnough"
+        case .unlock(let i, _, _):          return "unlock-\(i)"
+        case .unlockPermanent(let i, _, _): return "unlockPerm-\(i)"
+        case .refill(let i, _, _):          return "refill-\(i)"
+        case .founder(let i, _, _):         return "founder-\(i)"
+        case .notEnough:                    return "notEnough"
         }
     }
 }
@@ -1400,6 +1416,7 @@ enum AssetDialog: Identifiable {
 struct ContentView: View {
     @StateObject private var naiwa = NaiwaPlayer()
     @StateObject private var economy = Economy()
+    @StateObject private var store = StoreManager()
     @State private var assetDialog: AssetDialog?
     @State private var showHitZones = false
     @State private var showDebug = false
@@ -1526,6 +1543,26 @@ struct ContentView: View {
                         }
                     }
                     .padding(.top, 12)
+
+                    // Founder-pack sales entry — only until the pack is owned.
+                    if !economy.progress("gun").infinite {
+                        Button {
+                            presentDialog(.founder(id: "gun", name: "打枪", emoji: "🔫"))
+                        } label: {
+                            HStack(spacing: 5) {
+                                Text("🔫").font(.system(size: 13))
+                                Text("创始人礼包 · 限时")
+                                    .font(.system(size: 12, weight: .semibold))
+                            }
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Capsule().fill(Color(red: 0.95, green: 0.35, blue: 0.55).opacity(0.92)))
+                            .shadow(color: .black.opacity(0.25), radius: 5, y: 2)
+                        }
+                        .padding(.top, 8)
+                    }
+
                     Spacer()
                 }
 
@@ -1600,7 +1637,7 @@ struct ContentView: View {
                 // appears/fades instead of sliding up from the bottom.
                 if showSettings {
                     NavigationStack {
-                        SettingsView(onClose: {
+                        SettingsView(store: store, onClose: {
                             withAnimation(.easeInOut(duration: 0.15)) { showSettings = false }
                         })
                     }
@@ -1626,7 +1663,21 @@ struct ContentView: View {
                     assetDialogCard(dialog)
                         .transition(.scale(scale: 0.85).combined(with: .opacity))
                 }
+
+                // 加特林 discovery celebration.
+                if economy.justDiscoveredGatling {
+                    Color.black.opacity(0.45)
+                        .ignoresSafeArea()
+                        .transition(.opacity)
+                    dialogShell(emoji: "💥", title: "太幸运了！",
+                                message: "你的奶蛙偶然捡到了加特林！已解锁，送你 5 次",
+                                primary: "收下", secondary: nil) {
+                        withAnimation(.easeOut(duration: 0.2)) { economy.clearGatlingCelebration() }
+                    }
+                    .transition(.scale(scale: 0.8).combined(with: .opacity))
+                }
             }
+            .animation(.spring(response: 0.35, dampingFraction: 0.78), value: economy.justDiscoveredGatling)
         }
         .statusBarHidden()
         .sheet(isPresented: $showDebug) {
@@ -1650,12 +1701,26 @@ struct ContentView: View {
             }
         }
         .task {
+            // IAP: grant the founder pack from entitlements (purchase/restore/
+            // cross-device), then correct a stale equipped action.
+            store.onGunOwned = { economy.markPackOwned("gun") }
+            await store.refreshEntitlements()
+            validateEquip()
             // Periodic companion flush so the 5-minute task can complete while
             // the user simply keeps the app open watching奶蛙.
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 20_000_000_000)
                 economy.flushCompanion()
             }
+        }
+    }
+
+    /// The equipped right-hand action must be ∞ (gift or owned pack). Reset a
+    /// stale non-infinite value (e.g. an un-owned 打枪 from an old build) so it
+    /// can't be played free from the right-hand zone.
+    private func validateEquip() {
+        if let a = NaiwaAction.byId(naiwa.equippedActionId), !isInfiniteAction(a) {
+            naiwa.equippedActionId = NaiwaAction.defaultId
         }
     }
 
@@ -1719,6 +1784,9 @@ struct ContentView: View {
             } else {
                 presentDialog(.refill(id: a.id, name: a.name, emoji: a.emoji))
             }
+        case .unlockable:
+            if p.unlocked { playAndClose(a) }
+            else { presentDialog(.unlockPermanent(id: a.id, name: a.name, emoji: a.emoji)) }
         }
     }
 
@@ -1736,10 +1804,9 @@ struct ContentView: View {
     }
 
     private func handleVoiceTap(_ v: NaiwaVoiceProfile) {
-        // 免费 voice still locked → unlock dialog. Otherwise just select it.
-        // (Per-use metering of voices is deferred to the talk-flow slice.)
-        if v.tier == .free, !economy.progress(v.id).unlocked {
-            presentDialog(.unlock(id: v.id, name: v.name, emoji: v.emoji))
+        // 一次性买断 voice still locked → permanent-unlock dialog. Otherwise select.
+        if v.tier == .unlockable, !economy.progress(v.id).unlocked {
+            presentDialog(.unlockPermanent(id: v.id, name: v.name, emoji: v.emoji))
         } else {
             naiwa.voice.applyVoiceProfile(v)
             impact()
@@ -1754,26 +1821,28 @@ struct ContentView: View {
 
     private func isInfiniteAction(_ a: NaiwaAction) -> Bool {
         switch a.tier {
-        case .gift: return true
-        case .pack: return economy.progress(a.id).infinite
-        default:    return false
+        case .gift:       return true
+        case .pack:       return economy.progress(a.id).infinite
+        case .unlockable: return economy.progress(a.id).infinite
+        default:          return false
         }
     }
 
     private func actionBadge(_ a: NaiwaAction) -> ItemBadge {
         let p = economy.progress(a.id)
         switch a.tier {
-        case .gift:   return .infinite
-        case .free:   return p.unlocked ? (p.infinite ? .infinite : .uses(p.uses)) : .lockCoins(Economy.freeUnlockCost)
-        case .pack:   return p.infinite ? .infinite : .lockPack
-        case .hidden: return .uses(p.uses)
+        case .gift:       return .infinite
+        case .free:       return p.unlocked ? (p.infinite ? .infinite : .uses(p.uses)) : .lockCoins(Economy.freeUnlockCost)
+        case .pack:       return p.infinite ? .infinite : .lockPack
+        case .hidden:     return .uses(p.uses)
+        case .unlockable: return p.unlocked ? .infinite : .lockCoins(Economy.freeUnlockCost)
         }
     }
 
     private func voiceBadge(_ v: NaiwaVoiceProfile) -> ItemBadge {
         switch v.tier {
-        case .free: return economy.progress(v.id).unlocked ? .none : .lockCoins(Economy.freeUnlockCost)
-        default:    return .none
+        case .unlockable: return economy.progress(v.id).unlocked ? .none : .lockCoins(Economy.freeUnlockCost)
+        default:          return .none
         }
     }
 
@@ -1809,6 +1878,13 @@ struct ContentView: View {
                 if economy.unlockFree(id) { postUnlockUse(id); dismissDialog() }
                 else { withAnimation { assetDialog = .notEnough(needed: Economy.freeUnlockCost) } }
             }
+        case .unlockPermanent(let id, let name, let emoji):
+            dialogShell(emoji: emoji, title: "解锁 \(name)",
+                        message: "花 \(Economy.freeUnlockCost) 🪙 永久解锁 \(name)，之后随便用",
+                        primary: "花 \(Economy.freeUnlockCost) 🪙 永久解锁", secondary: "以后再说") {
+                if economy.unlockPermanent(id) { postUnlockUse(id); dismissDialog() }
+                else { withAnimation { assetDialog = .notEnough(needed: Economy.freeUnlockCost) } }
+            }
         case .refill(let id, let name, let emoji):
             dialogShell(emoji: emoji, title: "\(name) 次数用完了",
                         message: "花 \(Economy.refillCost) 🪙 再来 \(Economy.refillUses) 次",
@@ -1817,9 +1893,18 @@ struct ContentView: View {
                 else { withAnimation { assetDialog = .notEnough(needed: Economy.refillCost) } }
             }
         case .founder(_, let name, let emoji):
+            let price = store.displayPrice(StoreManager.ProductID.gunPack)
             dialogShell(emoji: emoji, title: "创始人限定 · \(name)",
-                        message: "创始人礼包 ¥2，永久无限次。内购即将开放。",
-                        primary: "知道了", secondary: nil) { dismissDialog() }
+                        message: "创始人礼包，永久无限次\(price.isEmpty ? "" : "（\(price)）")，限时开放。",
+                        primary: store.isBusy ? "购买中…" : (price.isEmpty ? "解锁" : "\(price) 解锁"),
+                        secondary: "以后再说") {
+                Task {
+                    if await store.purchase(StoreManager.ProductID.gunPack) {
+                        dismissDialog()
+                        showToast("🔫 打枪 已解锁，永久无限!")
+                    }
+                }
+            }
         case .notEnough(let needed):
             dialogShell(emoji: "🙈", title: "奶币不够啦",
                         message: "还差一点，先陪奶蛙多玩会儿赚奶币吧（需要 \(needed) 🪙）",
@@ -1982,25 +2067,32 @@ struct ContentView: View {
             withAnimation(.easeInOut(duration: 0.15)) { showTasks = true }
         } label: {
             HStack(spacing: 5) {
-                Text("🪙").font(.system(size: 14))
+                coinIcon(16)
                 Text("\(economy.coins)")
                     .font(.system(size: 15, weight: .bold, design: .rounded))
                     .foregroundColor(.white)
                     .contentTransition(.numericText())
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(Capsule().fill(Color.black.opacity(0.32)))
+            // Badge sits on the content (not the capsule edge) so it hugs the
+            // number instead of drifting out past the trailing padding.
             .overlay(alignment: .topTrailing) {
                 if economy.claimableTaskCount > 0 {
                     Circle().fill(Color.red)
-                        .frame(width: 9, height: 9)
-                        .overlay(Circle().stroke(Color.white.opacity(0.85), lineWidth: 1))
-                        .offset(x: 3, y: -3)
+                        .frame(width: 7, height: 7)
+                        .overlay(Circle().stroke(Color.white.opacity(0.9), lineWidth: 0.5))
+                        .offset(x: 5, y: -4)
                 }
             }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(Capsule().fill(Color.black.opacity(0.32)))
         }
         .animation(.snappy, value: economy.coins)
+    }
+
+    /// The 奶币 coin image (transparent PNG in Assets), sized square.
+    private func coinIcon(_ size: CGFloat) -> some View {
+        Image("奶币").resizable().scaledToFit().frame(width: size, height: size)
     }
 
     /// Bottom-corner chrome button (动作 / 音色) — icon-only in a translucent

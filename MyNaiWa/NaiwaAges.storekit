@@ -1,0 +1,46 @@
+{
+  "identifier" : "NAIWAAGES01",
+  "nonRenewingSubscriptions" : [],
+  "products" : [
+    {
+      "displayPrice" : "0.99",
+      "familyShareable" : false,
+      "internalID" : "1001",
+      "localizations" : [
+        {
+          "description" : "创始人限定，永久无限次·打枪",
+          "displayName" : "创始人礼包·打枪",
+          "locale" : "zh_CN"
+        }
+      ],
+      "productID" : "lxxdesign.MyNaiWa.founderpack.gun",
+      "referenceName" : "Founder Gun Pack",
+      "type" : "NonConsumable"
+    },
+    {
+      "displayPrice" : "0.99",
+      "familyShareable" : false,
+      "internalID" : "1002",
+      "localizations" : [
+        {
+          "description" : "请奶蛙喝一杯奶茶，纯感谢，不解锁任何内容",
+          "displayName" : "请奶蛙喝奶茶",
+          "locale" : "zh_CN"
+        }
+      ],
+      "productID" : "lxxdesign.MyNaiWa.tip.milktea",
+      "referenceName" : "Milk Tea Tip",
+      "type" : "Consumable"
+    }
+  ],
+  "settings" : {
+    "_applicationInternalID" : "6796403986",
+    "_developerTeamID" : "",
+    "_lastSynchronizedDate" : 0
+  },
+  "subscriptionGroups" : [],
+  "version" : {
+    "major" : 3,
+    "minor" : 0
+  }
+}
