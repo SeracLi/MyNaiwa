@@ -21,7 +21,7 @@
                                 <color key="textColor" red="0.0" green="0.0" blue="0.0" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>
                                 <nil key="highlightedColor"/>
                             </label>
-                            <imageView clipsSubviews="YES" userInteractionEnabled="NO" contentMode="scaleAspectFit" horizontalHuggingPriority="251" verticalHuggingPriority="251" image="启动页logo" translatesAutoresizingMaskIntoConstraints="NO" id="T04-kZ-7mR">
+                            <imageView clipsSubviews="YES" userInteractionEnabled="NO" contentMode="scaleAspectFit" horizontalHuggingPriority="251" verticalHuggingPriority="251" image="陨石" translatesAutoresizingMaskIntoConstraints="NO" id="T04-kZ-7mR">
                                 <rect key="frame" x="96" y="387.66666666666669" width="201" height="77"/>
                                 <constraints>
                                     <constraint firstAttribute="height" constant="77" id="AvD-iy-cMl"/>
@@ -46,6 +46,6 @@
         </scene>
     </scenes>
     <resources>
-        <image name="启动页logo" width="1024" height="1024"/>
+        <image name="陨石" width="244" height="244"/>
     </resources>
 </document>

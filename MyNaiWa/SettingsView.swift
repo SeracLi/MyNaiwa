@@ -40,6 +40,7 @@ struct SettingsView: View {
     @State private var showShareSheet = false
     @State private var showTipChooser = false
     @State private var thanksKind: TipKind?
+    @State private var restoreMsg: String?
 
     /// Which tip was just paid — drives the (differentiated) thank-you card.
     private enum TipKind {
@@ -83,7 +84,10 @@ struct SettingsView: View {
                             withAnimation(.easeOut(duration: 0.18)) { showTipChooser = true }
                         }
                         settingsRow(emoji: "🔄", title: "恢复购买") {
-                            Task { await store.restore() }
+                            Task {
+                                let restored = await store.restore()
+                                restoreMsg = restored ? "已恢复购买 🎉" : "没有可恢复的购买"
+                            }
                         }
 
                         divider
@@ -184,6 +188,12 @@ struct SettingsView: View {
         }
         .sheet(isPresented: $showShareSheet) {
             ShareSheet(items: [URL(string: Self.appStoreURL)!])
+        }
+        .alert("恢复购买", isPresented: Binding(get: { restoreMsg != nil },
+                                          set: { if !$0 { restoreMsg = nil } })) {
+            Button("好的", role: .cancel) { restoreMsg = nil }
+        } message: {
+            Text(restoreMsg ?? "")
         }
     }
 

@@ -1463,6 +1463,7 @@ struct ContentView: View {
     @State private var voicesPanelOpen = false
     @State private var toast: String?
     @State private var toastTask: Task<Void, Never>?
+    @State private var showMicDeniedAlert = false
     /// Bumped periodically to make the 🎁 founder entry wiggle occasionally.
     @State private var giftBeat = 0
     /// Dev A/B clarity test: overlay a standalone 720P clip over the main scene.
@@ -1516,10 +1517,12 @@ struct ContentView: View {
                 // A/B clarity test: overlay a standalone looping clip (奶蛙吃飞船,
                 // 720P) on top of the main scene to eyeball it against the 2K
                 // clips. Toggled from the top-left 🎬 button. Temporary dev tool.
+                #if DEBUG
                 if showTestVideo {
                     LoopingVideoView(resource: "奶蛙吃飞船720P测试", subdirectory: "video")
                         .ignoresSafeArea()
                 }
+                #endif
 
                 // iPad's taller aspect crops the top of the video (the earth).
                 // A short black→clear gradient at the very top softens that edge.
@@ -1582,14 +1585,17 @@ struct ContentView: View {
                             }
                             .padding(.trailing, 14)
                         }
-                        // Dev-only tools (gate/hide before shipping): debug panel
-                        // + a 720P/2K clarity A/B toggle. Centered.
+                        // Dev-only tools — compiled out of Release builds, so the
+                        // App Store binary never has them (reviewers never see
+                        // them), while they stay fully available in Debug.
+                        #if DEBUG
                         HStack(spacing: 10) {
                             circleIconButton("ladybug.fill", size: 17) { showDebug = true }
                             circleIconButton(showTestVideo ? "film.fill" : "film", size: 17) {
                                 showTestVideo.toggle()
                             }
                         }
+                        #endif
                     }
                     .padding(.top, 4)
 
@@ -1637,7 +1643,7 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
                         .padding(.leading, 28)
                         .padding(.bottom, 122)
-                        .transition(.scale(scale: 0.7, anchor: .bottomLeading).combined(with: .opacity))
+                        .transition(.opacity)   // gentle fade in/out, no pop
                 }
 
                 // Floating panels sit ABOVE the chrome so their items are fully
@@ -1736,16 +1742,28 @@ struct ContentView: View {
         // Lock the whole UI to light mode so our black-on-white panels/pages
         // stay legible regardless of the user's system appearance.
         .preferredColorScheme(.light)
+        .alert("需要麦克风权限", isPresented: $showMicDeniedAlert) {
+            Button("去设置") {
+                if let url = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(url)
+                }
+            }
+            Button("以后再说", role: .cancel) {}
+        } message: {
+            Text("变声功能需要麦克风。到系统设置里开启后，就能和奶蛙说话啦。")
+        }
+        #if DEBUG
         .sheet(isPresented: $showDebug) {
             DebugPanel(voice: naiwa.voice, economy: economy, showHitZones: $showHitZones)
         }
+        #endif
         .onAppear {
             // Route player events into the daily-task counters (idempotent).
             naiwa.onUserInteraction = { economy.recordInteraction() }
             naiwa.onSpeakStarted = { economy.recordTalk(); Analytics.log(.talkUsed) }
             naiwa.onMicResult = { granted in
-                showToast(granted ? "麦克风已开启，按住我就能说话啦 🎙️"
-                                  : "要用变声，请到系统设置里开启麦克风权限")
+                if granted { showToast("麦克风已开启，按住我就能说话啦 🎙️") }
+                else { showMicDeniedAlert = true }
             }
             economy.beginCompanionSession()
         }
@@ -1797,6 +1815,7 @@ struct ContentView: View {
                              selected: isEquipped, equipped: isEquipped,
                              locked: actionLocked(action), lockText: actionLockText(action),
                              badge: actionBadge(action),
+                             dimmed: naiwa.state.isInTalkMode,
                              onTap: { handleActionTap(action) },
                              onLongPress: { handleActionLongPress(action) })
             }
@@ -1833,11 +1852,9 @@ struct ContentView: View {
         case .pack:
             if p.infinite {
                 playAndClose(a)
-            } else if p.previewsUsed < Economy.packPreviewLimit {
-                economy.consumePreview(a.id)
-                playAndClose(a)
-                showToast("创始人礼包试玩 \(economy.progress(a.id).previewsUsed)/\(Economy.packPreviewLimit)")
             } else {
+                // Locked pack → always show the founder dialog (price + a 试玩
+                // button when previews remain), so users know it's paid.
                 presentDialog(.founder(id: a.id, name: a.name, emoji: a.emoji))
             }
         case .hidden:
@@ -2002,12 +2019,20 @@ struct ContentView: View {
                     withAnimation { assetDialog = .notEnough(needed: Economy.refillCost) }
                 }
             }
-        case .founder(_, let name, let emoji):
+        case .founder(let id, let name, let emoji):
             let price = store.displayPrice(StoreManager.ProductID.gunPack)
+            let previewsLeft = Economy.packPreviewLimit - economy.progress(id).previewsUsed
             dialogShell(image: "打枪礼包", emoji: emoji, glow: true, title: "创始人礼包 · \(name)",
                         message: "解锁后永久无限次\(name)\(price.isEmpty ? "" : "（\(price)）")，并可长按装备到右手。",
                         primary: store.isBusy ? "购买中…" : (price.isEmpty ? "解锁" : "\(price) 解锁"),
-                        secondary: "以后再说") {
+                        secondary: "以后再说",
+                        extra: previewsLeft > 0
+                            ? (title: "先试玩一次（还剩 \(previewsLeft) 次）", action: {
+                                economy.consumePreview(id)
+                                dismissDialog()
+                                naiwa.playAction(id)
+                              })
+                            : nil) {
                 Task {
                     if await store.purchase(StoreManager.ProductID.gunPack) {
                         dismissDialog()
@@ -2026,6 +2051,7 @@ struct ContentView: View {
     private func dialogShell(image: String? = nil, emoji: String, glow: Bool = false,
                              title: String, message: String,
                              primary: String, secondary: String?,
+                             extra: (title: String, action: () -> Void)? = nil,
                              onPrimary: @escaping () -> Void) -> some View {
         VStack(spacing: 14) {
             Group {
@@ -2045,6 +2071,15 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity).padding(.vertical, 13)
                         .background(Color.black).foregroundColor(.white)
                         .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+                }
+                if let extra {
+                    Button(action: extra.action) {
+                        Text(extra.title).font(.system(size: 15, weight: .semibold))
+                            .frame(maxWidth: .infinity).padding(.vertical, 11)
+                            .foregroundColor(.black)
+                            .overlay(RoundedRectangle(cornerRadius: 15, style: .continuous)
+                                .stroke(Color.black.opacity(0.25), lineWidth: 1.5))
+                    }
                 }
                 if let secondary {
                     Button(action: dismissDialog) {
@@ -2104,7 +2139,7 @@ struct ContentView: View {
     private func floatingItem(image: String?, emoji: String,
                               selected: Bool, equipped: Bool,
                               locked: Bool, lockText: String,
-                              badge: ItemBadge,
+                              badge: ItemBadge, dimmed: Bool = false,
                               onTap: @escaping () -> Void,
                               onLongPress: (() -> Void)? = nil) -> some View {
         ZStack {
@@ -2153,9 +2188,10 @@ struct ContentView: View {
                     .padding(.bottom, 5)
             }
         }
+        .opacity(dimmed ? 0.4 : 1)
         .contentShape(RoundedRectangle(cornerRadius: 19, style: .continuous))
-        .onTapGesture { onTap() }
-        .onLongPressGesture(minimumDuration: 0.35) { onLongPress?() }
+        .onTapGesture { if !dimmed { onTap() } }
+        .onLongPressGesture(minimumDuration: 0.35) { if !dimmed { onLongPress?() } }
     }
 
     @ViewBuilder
@@ -2309,6 +2345,14 @@ struct ContentView: View {
                 .frame(width: 56 * uiScale, height: 56 * uiScale)
                 .background(Color.black.opacity(0.5))
                 .clipShape(Circle())
+                // Top-lit white gradient rim — reads as a subtle 3D bevel, more
+                // inviting to tap.
+                .overlay(
+                    Circle().strokeBorder(
+                        LinearGradient(colors: [Color.white.opacity(0.08), Color.white.opacity(0.6)],
+                                       startPoint: .top, endPoint: .bottom),
+                        lineWidth: 1)
+                )
         }
     }
 

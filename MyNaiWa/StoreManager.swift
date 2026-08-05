@@ -71,11 +71,20 @@ final class StoreManager: ObservableObject {
     }
 
     /// Restore purchases (required by App Review for the non-consumable pack).
-    func restore() async {
+    /// Returns true if anything was actually restored (drives user feedback).
+    @discardableResult
+    func restore() async -> Bool {
         isBusy = true
         defer { isBusy = false }
         try? await AppStore.sync()
-        await refreshEntitlements()
+        var found = false
+        for await result in Transaction.currentEntitlements {
+            if case .verified(let transaction) = result {
+                await grant(transaction)
+                found = true
+            }
+        }
+        return found
     }
 
     /// Re-grant currently-owned non-consumables — call on launch and after restore.
