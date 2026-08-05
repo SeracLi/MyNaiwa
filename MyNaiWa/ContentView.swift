@@ -71,8 +71,8 @@ struct NaiwaAction: Identifiable {
 
     static let catalog: [NaiwaAction] = [
         NaiwaAction(id: "taiji",     name: "打太极", clip: .taiji,     emoji: "🥋",  image: "太极",   tier: .gift),
-        NaiwaAction(id: "spacesuit", name: "太空服", clip: .spacesuit, emoji: "🧑‍🚀", image: "宇航员", tier: .free),
         NaiwaAction(id: "bread",     name: "吃面包", clip: .bread,     emoji: "🍞",  image: "面包",   tier: .free),
+        NaiwaAction(id: "spacesuit", name: "太空服", clip: .spacesuit, emoji: "🧑‍🚀", image: "宇航员", tier: .free),
         NaiwaAction(id: "gun",       name: "打枪",   clip: .gun,       emoji: "🔫",  image: "手枪",   tier: .pack),
         NaiwaAction(id: "gatling",   name: "加特林", clip: .gatling,   emoji: "💥",  image: "加特林", tier: .hidden),
     ]
@@ -215,11 +215,11 @@ struct NaiwaVoiceProfile: Identifiable {
         NaiwaVoiceProfile(id: "naiwa", name: "奶蛙原声", emoji: "🐸", tier: .gift,
                           pitchCents: -900, distortion: .none, distortionMix: 0,
                           eqBassGain: -4, eqBassFreq: 210,
-                          noiseReduction: true, voiceBoost: false),
+                          noiseReduction: false, voiceBoost: false),
         NaiwaVoiceProfile(id: "loli", name: "萝莉音", emoji: "👧", tier: .unlockable,
                           pitchCents: 700, distortion: .none, distortionMix: 0,
                           eqBassGain: -3, eqBassFreq: 200,
-                          noiseReduction: true, voiceBoost: true),
+                          noiseReduction: false, voiceBoost: true),
     ]
 
     static let defaultId = "naiwa"
@@ -255,7 +255,7 @@ final class NaiwaVoice: ObservableObject {
     /// Apple Voice Processing IO on the mic — noise suppression + echo cancel +
     /// AGC (the same pipeline FaceTime uses). This is the main "clean like Tom
     /// Cat" lever. Toggling reconfigures the engine (needs a stop/start).
-    @Published var noiseReduction: Bool = true {
+    @Published var noiseReduction: Bool = false {   // off this version (VPIO route isn't captured by screen recording)
         didSet {
             guard oldValue != noiseReduction else { return }
             defaults.set(noiseReduction, forKey: Keys.noiseReduction)
@@ -706,6 +706,10 @@ final class NaiwaPlayer: ObservableObject {
     let voice = NaiwaVoice()
 
     @Published private(set) var state: NaiwaState = .idle
+    /// True once the idle clip's first frame is actually on screen — used to
+    /// hold a launch cover so users never see a black screen with UI on top.
+    @Published private(set) var firstFrameReady = false
+    private var readyObserver: NSKeyValueObservation?
 
     /// Record button is always enabled. Pressing it from ANY state interrupts
     /// whatever奶蛙 is doing (filler, laugh, floating, even mid-speak) and jumps
@@ -752,6 +756,9 @@ final class NaiwaPlayer: ObservableObject {
     var onUserInteraction: (() -> Void)?
     /// Fired when奶蛙 actually starts speaking back a recording (real speech).
     var onSpeakStarted: (() -> Void)?
+    /// Fired after the FIRST mic-permission request resolves (granted flag) so
+    /// the UI can hint ("mic enabled, hold to talk" / "enable it in Settings").
+    var onMicResult: ((Bool) -> Void)?
 
     /// KVO tokens kept alive so we can preroll each clip once its item is ready.
     private var prewarmObservers: [NSKeyValueObservation] = []
@@ -792,14 +799,38 @@ final class NaiwaPlayer: ObservableObject {
         }
         setupLifecycle()
         wireVoice()
+        // Returning users who already granted the mic get one-press talk (no
+        // "first press just enables it" detour).
+        if AVAudioApplication.shared.recordPermission == .granted {
+            talkModeReady = true
+        }
         players[.idle]?.play()
         prewarmDecoders()
+
+        // Signal when the idle clip's first frame is actually displayed (KVO on
+        // isReadyForDisplay), so the launch cover can fade at exactly the right
+        // moment. A 3s fallback guarantees the cover never sticks.
+        if let idleLayer = layers[.idle] {
+            if idleLayer.isReadyForDisplay {
+                firstFrameReady = true
+            } else {
+                readyObserver = idleLayer.observe(\.isReadyForDisplay, options: [.new]) { [weak self] layer, _ in
+                    guard layer.isReadyForDisplay else { return }
+                    Task { @MainActor [weak self] in self?.firstFrameReady = true }
+                }
+            }
+        }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            self?.firstFrameReady = true
+        }
     }
 
     deinit {
         endObservers.values.forEach { NotificationCenter.default.removeObserver($0) }
         lifecycleObservers.forEach { NotificationCenter.default.removeObserver($0) }
         prewarmObservers.forEach { $0.invalidate() }
+        readyObserver?.invalidate()
     }
 
     // MARK: Decoder prewarm
@@ -1125,19 +1156,16 @@ final class NaiwaPlayer: ObservableObject {
             _ = voice.enterTalkMode()
             beginTalk(interrupt: isInterrupt)
         } else {
-            // First time: request mic permission (async). Hold state so a
-            // stale audio-end callback can't send us down the exit path.
-            state = .talkEntering
+            // First-ever press with permission not yet granted: request it but
+            // DON'T enter talk mode. The system dialog steals the touch, so the
+            // press-and-hold can't reliably continue — instead we just enable the
+            // mic and stay in the default idle state (button returns to white).
+            // The user's NEXT press actually talks. `onMicResult` drives a hint.
             Task { @MainActor in
                 let granted = await voice.requestMicPermission()
-                guard granted, voice.enterTalkMode() else {
-                    print("⚠️ mic permission denied / talk-mode failed")
-                    state = .idle
-                    switchTo(.idle)
-                    return
-                }
-                talkModeReady = true
-                beginTalk(interrupt: isInterrupt)
+                if granted { talkModeReady = true }
+                if state != .idle { state = .idle; switchTo(.idle) }
+                onMicResult?(granted)
             }
         }
     }
@@ -1428,6 +1456,9 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var showTasks = false
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.horizontalSizeClass) private var hSizeClass
+    /// Chrome/panels are scaled up on iPad so they don't look tiny.
+    private var uiScale: CGFloat { hSizeClass == .regular ? 1.4 : 1.0 }
     @State private var actionsPanelOpen = false
     @State private var voicesPanelOpen = false
     @State private var toast: String?
@@ -1488,6 +1519,17 @@ struct ContentView: View {
                 if showTestVideo {
                     LoopingVideoView(resource: "奶蛙吃飞船720P测试", subdirectory: "video")
                         .ignoresSafeArea()
+                }
+
+                // iPad's taller aspect crops the top of the video (the earth).
+                // A short black→clear gradient at the very top softens that edge.
+                if hSizeClass == .regular {
+                    LinearGradient(gradient: Gradient(colors: [.black, .clear]),
+                                   startPoint: .top, endPoint: .bottom)
+                        .frame(height: 40)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                        .ignoresSafeArea()
+                        .allowsHitTesting(false)
                 }
 
                 // Full-screen tap layer (ignores safe area) so 浮起来 hit-tests
@@ -1576,6 +1618,7 @@ struct ContentView: View {
                         RecordButton(
                             isActive:  naiwa.isRecording,
                             isEnabled: naiwa.recordButtonEnabled,
+                            scale:     uiScale,
                             onPress:   { closePanels(); naiwa.recordButtonPressed() },
                             onRelease: { naiwa.recordButtonReleased() }
                         )
@@ -1590,6 +1633,7 @@ struct ContentView: View {
                 // Hidden once owned, and mutually exclusive with the 动作 panel.
                 if !economy.progress("gun").infinite && !actionsPanelOpen {
                     founderTile
+                        .scaleEffect(uiScale, anchor: .bottomLeading)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
                         .padding(.leading, 28)
                         .padding(.bottom, 122)
@@ -1601,6 +1645,7 @@ struct ContentView: View {
                 // triggering corner button (Tom-Cat style).
                 if actionsPanelOpen {
                     actionPanel
+                        .scaleEffect(uiScale, anchor: .bottomLeading)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
                         .padding(.leading, 18)
                         .padding(.bottom, 124)
@@ -1608,6 +1653,7 @@ struct ContentView: View {
                 }
                 if voicesPanelOpen {
                     voicePanel
+                        .scaleEffect(uiScale, anchor: .bottomTrailing)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                         .padding(.trailing, 18)
                         .padding(.bottom, 124)
@@ -1674,6 +1720,15 @@ struct ContentView: View {
                     }
                     .transition(.scale(scale: 0.8).combined(with: .opacity))
                 }
+
+                // Launch cover — plain black, held on top until the video's first
+                // frame is actually on screen, then fades. (No logo: it would sit
+                // lower than the LaunchScreen logo and read as a jump.)
+                Color.black
+                    .ignoresSafeArea()
+                    .opacity(naiwa.firstFrameReady ? 0 : 1)
+                    .allowsHitTesting(!naiwa.firstFrameReady)
+                    .animation(.easeOut(duration: 0.45), value: naiwa.firstFrameReady)
             }
             .animation(.spring(response: 0.35, dampingFraction: 0.78), value: economy.justDiscoveredGatling)
         }
@@ -1687,7 +1742,11 @@ struct ContentView: View {
         .onAppear {
             // Route player events into the daily-task counters (idempotent).
             naiwa.onUserInteraction = { economy.recordInteraction() }
-            naiwa.onSpeakStarted = { economy.recordTalk() }
+            naiwa.onSpeakStarted = { economy.recordTalk(); Analytics.log(.talkUsed) }
+            naiwa.onMicResult = { granted in
+                showToast(granted ? "麦克风已开启，按住我就能说话啦 🎙️"
+                                  : "要用变声，请到系统设置里开启麦克风权限")
+            }
             economy.beginCompanionSession()
         }
         .onChange(of: scenePhase) { _, phase in
@@ -1702,6 +1761,7 @@ struct ContentView: View {
             }
         }
         .task {
+            Analytics.log(.appOpen)
             // IAP: grant the founder pack from entitlements (purchase/restore/
             // cross-device), then correct a stale equipped action.
             store.onGunOwned = { economy.markPackOwned("gun") }
@@ -1735,6 +1795,7 @@ struct ContentView: View {
                 let isEquipped = action.id == naiwa.equippedActionId
                 floatingItem(image: action.image, emoji: action.emoji,
                              selected: isEquipped, equipped: isEquipped,
+                             locked: actionLocked(action), lockText: actionLockText(action),
                              badge: actionBadge(action),
                              onTap: { handleActionTap(action) },
                              onLongPress: { handleActionLongPress(action) })
@@ -1747,7 +1808,8 @@ struct ContentView: View {
             ForEach(NaiwaVoiceProfile.all) { profile in
                 floatingItem(image: nil, emoji: profile.emoji,   // voice images not ready → emoji
                              selected: profile.id == naiwa.voice.selectedVoiceId, equipped: false,
-                             badge: voiceBadge(profile),
+                             locked: voiceLocked(profile), lockText: "\(Economy.freeUnlockCost)奶币解锁",
+                             badge: .none,
                              onTap: { handleVoiceTap(profile) })
             }
         }
@@ -1817,12 +1879,14 @@ struct ContentView: View {
             presentDialog(.unlockPermanent(id: v.id, name: v.name, emoji: v.emoji))
         } else {
             naiwa.voice.applyVoiceProfile(v)
+            Analytics.log(.voiceSwitched(id: v.id))
             impact()
             closePanels()
         }
     }
 
     private func playAndClose(_ a: NaiwaAction) {
+        Analytics.log(.actionPlayed(id: a.id, tier: a.tier.rawValue))
         naiwa.playAction(a.id)
         closePanels()
     }
@@ -1836,27 +1900,49 @@ struct ContentView: View {
         }
     }
 
+    /// Corner badge for UNLOCKED items only (locked ones use the lock overlay).
     private func actionBadge(_ a: NaiwaAction) -> ItemBadge {
         let p = economy.progress(a.id)
         switch a.tier {
         case .gift:       return .infinite
-        case .free:       return p.unlocked ? (p.infinite ? .infinite : .uses(p.uses)) : .lockCoins(Economy.freeUnlockCost)
-        case .pack:       return p.infinite ? .infinite : .lockPack
+        case .free:       return p.unlocked ? (p.infinite ? .infinite : .uses(p.uses)) : .none
+        case .pack:       return p.infinite ? .infinite : .none
         case .hidden:     return .uses(p.uses)
-        case .unlockable: return p.unlocked ? .infinite : .lockCoins(Economy.freeUnlockCost)
+        case .unlockable: return p.unlocked ? .infinite : .none
         }
     }
 
-    private func voiceBadge(_ v: NaiwaVoiceProfile) -> ItemBadge {
-        switch v.tier {
-        case .unlockable: return economy.progress(v.id).unlocked ? .none : .lockCoins(Economy.freeUnlockCost)
-        default:          return .none
+    /// Is the asset locked (needs acquiring) → show the lock overlay.
+    private func actionLocked(_ a: NaiwaAction) -> Bool {
+        let p = economy.progress(a.id)
+        switch a.tier {
+        case .free, .unlockable: return !p.unlocked
+        case .pack:              return !p.infinite
+        default:                 return false
         }
+    }
+
+    private func actionLockText(_ a: NaiwaAction) -> String {
+        switch a.tier {
+        case .free, .unlockable: return "\(Economy.freeUnlockCost)奶币解锁"
+        case .pack:              return "创始人礼包"
+        default:                 return ""
+        }
+    }
+
+    private func voiceLocked(_ v: NaiwaVoiceProfile) -> Bool {
+        v.tier == .unlockable && !economy.progress(v.id).unlocked
     }
 
     // MARK: Unlock dialog
 
     private func presentDialog(_ d: AssetDialog) {
+        switch d {
+        case .founder:                       Analytics.log(.founderDialogShown)
+        case .unlock(let id, _, _):          Analytics.log(.lockedTapped(id: id, tier: "free"))
+        case .unlockPermanent(let id, _, _): Analytics.log(.lockedTapped(id: id, tier: "unlockable"))
+        default: break
+        }
         closePanels()
         withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) { assetDialog = d }
     }
@@ -1883,8 +1969,12 @@ struct ContentView: View {
                         primary: "花 \(Economy.freeUnlockCost) 🪙 解锁", secondary: "以后再说") {
                 if economy.unlockFree(id) {
                     postUnlock(id); dismissDialog()
+                    Analytics.log(.unlockSucceeded(id: id, cost: Economy.freeUnlockCost))
                     showToast("已解锁 \(name) · 送你 \(Economy.freeUnlockUses) 次")
-                } else { withAnimation { assetDialog = .notEnough(needed: Economy.freeUnlockCost) } }
+                } else {
+                    Analytics.log(.unlockFailedNoCoins(id: id))
+                    withAnimation { assetDialog = .notEnough(needed: Economy.freeUnlockCost) }
+                }
             }
         case .unlockPermanent(let id, let name, let emoji):
             dialogShell(image: NaiwaAction.byId(id)?.image, emoji: emoji, title: "解锁 \(name)",
@@ -1892,8 +1982,12 @@ struct ContentView: View {
                         primary: "花 \(Economy.freeUnlockCost) 🪙 永久解锁", secondary: "以后再说") {
                 if economy.unlockPermanent(id) {
                     postUnlock(id); dismissDialog()
+                    Analytics.log(.unlockSucceeded(id: id, cost: Economy.freeUnlockCost))
                     showToast("已永久解锁 \(name)")
-                } else { withAnimation { assetDialog = .notEnough(needed: Economy.freeUnlockCost) } }
+                } else {
+                    Analytics.log(.unlockFailedNoCoins(id: id))
+                    withAnimation { assetDialog = .notEnough(needed: Economy.freeUnlockCost) }
+                }
             }
         case .refill(let id, let name, let emoji):
             dialogShell(image: NaiwaAction.byId(id)?.image, emoji: emoji, title: "\(name) 次数用完了",
@@ -1901,8 +1995,12 @@ struct ContentView: View {
                         primary: "花 \(Economy.refillCost) 🪙 购买", secondary: "以后再说") {
                 if economy.refill(id) {
                     postUnlock(id); dismissDialog()
+                    Analytics.log(.refilled(id: id))
                     showToast("已充值 · 再来 \(Economy.refillUses) 次")
-                } else { withAnimation { assetDialog = .notEnough(needed: Economy.refillCost) } }
+                } else {
+                    Analytics.log(.unlockFailedNoCoins(id: id))
+                    withAnimation { assetDialog = .notEnough(needed: Economy.refillCost) }
+                }
             }
         case .founder(_, let name, let emoji):
             let price = store.displayPrice(StoreManager.ProductID.gunPack)
@@ -1913,6 +2011,7 @@ struct ContentView: View {
                 Task {
                     if await store.purchase(StoreManager.ProductID.gunPack) {
                         dismissDialog()
+                        Analytics.log(.founderPurchased)
                         showToast("🔫 打枪 已解锁，永久无限!")
                     }
                 }
@@ -2004,6 +2103,7 @@ struct ContentView: View {
     /// text name. Tap fires `onTap`; long-press fires `onLongPress` (equip).
     private func floatingItem(image: String?, emoji: String,
                               selected: Bool, equipped: Bool,
+                              locked: Bool, lockText: String,
                               badge: ItemBadge,
                               onTap: @escaping () -> Void,
                               onLongPress: (() -> Void)? = nil) -> some View {
@@ -2021,7 +2121,28 @@ struct ContentView: View {
             RoundedRectangle(cornerRadius: 19, style: .continuous)
                 .strokeBorder(selected ? Color.black : Color.clear, lineWidth: 2)
         )
-        .overlay(alignment: .topTrailing) { badgeView(badge) }
+        // Locked: dim scrim + white lock + how-to-get. Replaces the corner badge.
+        .overlay {
+            if locked {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 19, style: .continuous)
+                        .fill(Color.black.opacity(0.42))
+                    VStack(spacing: 3) {
+                        Image(systemName: "lock.fill")
+                            .font(.system(size: 19, weight: .bold))
+                            .foregroundColor(.white)
+                        Text(lockText)
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.white)
+                            .multilineTextAlignment(.center)
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.8)
+                            .padding(.horizontal, 4)
+                    }
+                }
+            }
+        }
+        .overlay(alignment: .topTrailing) { if !locked { badgeView(badge) } }
         .overlay(alignment: .bottom) {
             if equipped {
                 Text("装配中")
@@ -2066,6 +2187,7 @@ struct ContentView: View {
     }
 
     private func toggleActionsPanel() {
+        if !actionsPanelOpen { Analytics.log(.panelOpened(kind: "action")) }
         withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
             voicesPanelOpen = false
             actionsPanelOpen.toggle()
@@ -2073,6 +2195,7 @@ struct ContentView: View {
     }
 
     private func toggleVoicesPanel() {
+        if !voicesPanelOpen { Analytics.log(.panelOpened(kind: "voice")) }
         withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
             actionsPanelOpen = false
             voicesPanelOpen.toggle()
@@ -2111,9 +2234,9 @@ struct ContentView: View {
             withAnimation(.easeInOut(duration: 0.15)) { showTasks = true }
         } label: {
             HStack(spacing: 6) {
-                coinIcon(22)
+                coinIcon(22 * uiScale)
                 Text("\(economy.coins)")
-                    .font(.system(size: 18, weight: .bold, design: .rounded))
+                    .font(.system(size: 18 * uiScale, weight: .bold, design: .rounded))
                     .foregroundColor(.white)
                     .contentTransition(.numericText())
             }
@@ -2182,9 +2305,9 @@ struct ContentView: View {
     private func bottomChromeButton(_ emoji: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(emoji)
-                .font(.system(size: 27))
-                .frame(width: 56, height: 56)
-                .background(Color.black.opacity(0.7))
+                .font(.system(size: 27 * uiScale))
+                .frame(width: 56 * uiScale, height: 56 * uiScale)
+                .background(Color.black.opacity(0.5))
                 .clipShape(Circle())
         }
     }
@@ -2193,9 +2316,9 @@ struct ContentView: View {
     private func circleIconButton(_ symbol: String, size: CGFloat, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: symbol)
-                .font(.system(size: size, weight: .semibold))
+                .font(.system(size: size * uiScale, weight: .semibold))
                 .foregroundColor(.white.opacity(0.78))
-                .padding(9)
+                .padding(9 * uiScale)
                 .background(Color.black.opacity(0.28))
                 .clipShape(Circle())
         }
@@ -2206,8 +2329,8 @@ struct ContentView: View {
     private func circleEmojiButton(_ emoji: String, size: CGFloat, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(emoji)
-                .font(.system(size: size))
-                .padding(8)
+                .font(.system(size: size * uiScale))
+                .padding(8 * uiScale)
                 .background(Color.black.opacity(0.28))
                 .clipShape(Circle())
         }
@@ -2316,6 +2439,7 @@ struct ContentView: View {
 struct RecordButton: View {
     let isActive: Bool                  // manager is in recording phase
     let isEnabled: Bool                 // manager accepts press input right now
+    var scale: CGFloat = 1              // enlarged on iPad
     let onPress: () -> Void
     let onRelease: () -> Void
 
@@ -2387,6 +2511,7 @@ struct RecordButton: View {
                 .foregroundColor(isHot ? .white : Color(white: 0.13))
                 .shadow(color: .black.opacity(isHot ? 0.25 : 0), radius: 1, y: 1)
         }
+        .scaleEffect(scale)   // iPad enlargement (layout footprint stays the same)
         // Whole button "recesses" when pressed: slightly smaller + softer shadow.
         .scaleEffect(isPressed ? 0.93 : 1.0)
         .shadow(

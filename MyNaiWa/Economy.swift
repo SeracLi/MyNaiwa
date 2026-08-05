@@ -10,6 +10,38 @@
 
 import SwiftUI
 import Combine
+import Security
+
+// MARK: - Anti-farm keychain flag
+
+/// The starting-coin grant is guarded by a keychain flag. Keychain items survive
+/// app deletion on the same device, so uninstalling + reinstalling can't re-farm
+/// the initial 50 coins (the bug the old 奶蛙 hit). iCloud KV covers cross-device.
+private enum StartingGrant {
+    private static let service = "lxxdesign.MyNaiWa"
+    private static let account = "naiwa_startingGrantClaimed"
+
+    static var isClaimed: Bool {
+        let q: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        return SecItemCopyMatching(q as CFDictionary, nil) == errSecSuccess
+    }
+
+    static func markClaimed() {
+        let q: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecValueData as String: Data([1]),
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
+        ]
+        SecItemDelete(q as CFDictionary)
+        SecItemAdd(q as CFDictionary, nil)
+    }
+}
 
 // MARK: - Asset tiers
 
@@ -131,8 +163,15 @@ final class Economy: ObservableObject {
         if let best = [local, remote].compactMap({ $0 }).max(by: { $0.updatedAt < $1.updatedAt }) {
             apply(best)
         } else {
-            // Fresh install — grant the starting balance.
-            coins = Self.startingCoins
+            // Fresh install (no local + no cloud snapshot). Guard the starting
+            // grant against uninstall→reinstall farming with a keychain flag that
+            // survives app deletion: a reinstaller gets 0, a true new user gets 50.
+            if StartingGrant.isClaimed {
+                coins = 0
+            } else {
+                coins = Self.startingCoins
+                StartingGrant.markClaimed()
+            }
             assets = [:]
             updatedAt = Date().timeIntervalSince1970
             persist()
@@ -249,6 +288,7 @@ final class Economy: ObservableObject {
         guard isTaskComplete(t), !isTaskClaimed(t) else { return false }
         taskClaimed[t.id] = true
         earn(t.reward)   // earn() bumps + persists
+        Analytics.log(.taskClaimed(id: t.id, reward: t.reward))
         return true
     }
 
@@ -257,6 +297,7 @@ final class Economy: ObservableObject {
     func recordInteraction() {
         rolloverIfNeeded()
         lifetimeInteractions += 1
+        if lifetimeInteractions == 1 { Analytics.log(.firstInteraction) }
         if taskValue("interact") < 1 { taskProgress["interact"] = 1 }
         rollGatling()
         bump()
@@ -273,6 +314,7 @@ final class Economy: ObservableObject {
             discoverHidden(Self.gatlingId)   // reveal + 5 uses (bumps)
             gatlingMiss = 0
             justDiscoveredGatling = true
+            Analytics.log(.gatlingTriggered)
         } else {
             gatlingMiss += 1
         }

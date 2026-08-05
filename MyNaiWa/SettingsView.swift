@@ -61,9 +61,11 @@ struct SettingsView: View {
                     VStack(spacing: 0) {
                         // Rate & Share
                         settingsRow(emoji: "🤩", title: "去给奶蛙时代评分") {
+                            Analytics.log(.rateTapped)
                             openURL("\(Self.appStoreURL)?action=write-review")
                         }
                         settingsRow(emoji: "📤", title: "分享给朋友") {
+                            Analytics.log(.shareTapped)
                             showShareSheet = true
                         }
 
@@ -221,6 +223,7 @@ struct SettingsView: View {
         return Button {
             Task {
                 if await store.purchase(id) {
+                    Analytics.log(.tipPurchased(kind: id == StoreManager.ProductID.milkTea ? "milktea" : "food"))
                     withAnimation(.easeOut(duration: 0.2)) {
                         showTipChooser = false
                         thanksKind = (id == StoreManager.ProductID.milkTea) ? .milktea : .food
