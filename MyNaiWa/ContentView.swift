@@ -28,6 +28,7 @@ enum NaiwaClip: String, CaseIterable {
     case taiji      = "打太极"
     case spacesuit  = "太空服"
     case gatling    = "加特林"
+    case bread      = "吃面包"
     case laugh      = "肚子和胳膊-大笑"
     case floating   = "腿与脚-浮起来"
     case talkEnter  = "进入"
@@ -39,7 +40,7 @@ enum NaiwaClip: String, CaseIterable {
     var subdirectory: String {
         switch self {
         case .talkEnter, .talkListen, .talkSpeak, .talkExit: return "video/变声模式"
-        case .gun, .taiji, .spacesuit, .gatling: return "video/可配动作"
+        case .gun, .taiji, .spacesuit, .gatling, .bread: return "video/可配动作"
         default: return "video"
         }
     }
@@ -64,19 +65,22 @@ struct NaiwaAction: Identifiable {
     let id: String
     let name: String
     let clip: NaiwaClip
-    let emoji: String       // Apple emoji shown in the floating 动作 panel
+    let emoji: String       // fallback icon (toasts / assets without an image)
+    let image: String       // Assets image name shown in the floating 动作 panel
     let tier: AssetTier     // 赠送 / 免费 / 礼包 / 隐藏 — drives unlock & uses
 
     static let catalog: [NaiwaAction] = [
-        NaiwaAction(id: "taiji",     name: "打太极", clip: .taiji,     emoji: "🥋",  tier: .gift),
-        NaiwaAction(id: "spacesuit", name: "太空服", clip: .spacesuit, emoji: "🧑‍🚀", tier: .free),
-        NaiwaAction(id: "gun",       name: "打枪",   clip: .gun,       emoji: "🔫",  tier: .pack),
-        NaiwaAction(id: "gatling",   name: "加特林", clip: .gatling,   emoji: "💥",  tier: .hidden),
+        NaiwaAction(id: "taiji",     name: "打太极", clip: .taiji,     emoji: "🥋",  image: "太极",   tier: .gift),
+        NaiwaAction(id: "spacesuit", name: "太空服", clip: .spacesuit, emoji: "🧑‍🚀", image: "宇航员", tier: .free),
+        NaiwaAction(id: "bread",     name: "吃面包", clip: .bread,     emoji: "🍞",  image: "面包",   tier: .free),
+        NaiwaAction(id: "gun",       name: "打枪",   clip: .gun,       emoji: "🔫",  image: "手枪",   tier: .pack),
+        NaiwaAction(id: "gatling",   name: "加特林", clip: .gatling,   emoji: "💥",  image: "加特林", tier: .hidden),
     ]
 
     static func byId(_ id: String) -> NaiwaAction? { catalog.first { $0.id == id } }
-    /// Default right-hand action — a 赠送 (∞) one, since 打枪 is now a paid pack.
-    static let defaultId = "taiji"
+    /// Default right-hand = NONE ("") → the right zone plays 挠头. Only ∞ actions
+    /// can be equipped (via long-press), and long-pressing again unequips.
+    static let defaultId = ""
 }
 
 // MARK: - State machine
@@ -735,11 +739,12 @@ final class NaiwaPlayer: ObservableObject {
     private var interactionRewindZone: TapZone?
 
     /// The equipped right-arm action, persisted. Tapping奶蛙's left arm plays it.
+    /// "" = no action equipped → the right zone plays 挠头 (snappy default).
     @Published var equippedActionId: String = NaiwaAction.defaultId {
         didSet { UserDefaults.standard.set(equippedActionId, forKey: "naiwa_equippedAction") }
     }
     private var equippedClip: NaiwaClip {
-        NaiwaAction.byId(equippedActionId)?.clip ?? .taiji
+        equippedActionId.isEmpty ? .head : (NaiwaAction.byId(equippedActionId)?.clip ?? .head)
     }
 
     /// Fired when the user starts a fresh interaction (zone tap / panel action).
@@ -1427,6 +1432,8 @@ struct ContentView: View {
     @State private var voicesPanelOpen = false
     @State private var toast: String?
     @State private var toastTask: Task<Void, Never>?
+    /// Bumped periodically to make the 🎁 founder entry wiggle occasionally.
+    @State private var giftBeat = 0
     /// Dev A/B clarity test: overlay a standalone 720P clip over the main scene.
     @State private var showTestVideo = false
 
@@ -1528,7 +1535,7 @@ struct ContentView: View {
                                 .padding(.leading, 14)
                             Spacer()
                             // User-facing settings.
-                            circleIconButton("line.3.horizontal", size: 19) {
+                            circleEmojiButton("⚙️", size: 19) {
                                 withAnimation(.easeInOut(duration: 0.15)) { showSettings = true }
                             }
                             .padding(.trailing, 14)
@@ -1542,26 +1549,7 @@ struct ContentView: View {
                             }
                         }
                     }
-                    .padding(.top, 12)
-
-                    // Founder-pack sales entry — only until the pack is owned.
-                    if !economy.progress("gun").infinite {
-                        Button {
-                            presentDialog(.founder(id: "gun", name: "打枪", emoji: "🔫"))
-                        } label: {
-                            HStack(spacing: 5) {
-                                Text("🔫").font(.system(size: 13))
-                                Text("创始人礼包 · 限时")
-                                    .font(.system(size: 12, weight: .semibold))
-                            }
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .background(Capsule().fill(Color(red: 0.95, green: 0.35, blue: 0.55).opacity(0.92)))
-                            .shadow(color: .black.opacity(0.25), radius: 5, y: 2)
-                        }
-                        .padding(.top, 8)
-                    }
+                    .padding(.top, 4)
 
                     Spacer()
                 }
@@ -1583,7 +1571,7 @@ struct ContentView: View {
                     // GeometryReader anchors content at its top-left, it shifted
                     // everything (video + buttons) right with the right edge cut off.
                     HStack {
-                        bottomChromeButton("figure.run") { toggleActionsPanel() }
+                        bottomChromeButton("👻") { toggleActionsPanel() }
                         Spacer()
                         RecordButton(
                             isActive:  naiwa.isRecording,
@@ -1592,11 +1580,21 @@ struct ContentView: View {
                             onRelease: { naiwa.recordButtonReleased() }
                         )
                         Spacer()
-                        bottomChromeButton("waveform") { toggleVoicesPanel() }
+                        bottomChromeButton("🎺") { toggleVoicesPanel() }
                     }
                     .padding(.horizontal, 26)
                 }
                 .padding(.bottom, 26)
+
+                // Founder-pack entry — a compact tile just above the 动作 button.
+                // Hidden once owned, and mutually exclusive with the 动作 panel.
+                if !economy.progress("gun").infinite && !actionsPanelOpen {
+                    founderTile
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                        .padding(.leading, 28)
+                        .padding(.bottom, 122)
+                        .transition(.scale(scale: 0.7, anchor: .bottomLeading).combined(with: .opacity))
+                }
 
                 // Floating panels sit ABOVE the chrome so their items are fully
                 // tappable and can overlap the buttons. Anchored just above their
@@ -1605,14 +1603,14 @@ struct ContentView: View {
                     actionPanel
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
                         .padding(.leading, 18)
-                        .padding(.bottom, 104)
+                        .padding(.bottom, 124)
                         .transition(.scale(scale: 0.6, anchor: .bottomLeading).combined(with: .opacity))
                 }
                 if voicesPanelOpen {
                     voicePanel
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                         .padding(.trailing, 18)
-                        .padding(.bottom, 104)
+                        .padding(.bottom, 124)
                         .transition(.scale(scale: 0.6, anchor: .bottomTrailing).combined(with: .opacity))
                 }
 
@@ -1629,7 +1627,7 @@ struct ContentView: View {
                         .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                         .padding(.top, 78)
-                        .transition(.move(edge: .top).combined(with: .opacity))
+                        .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .top)))
                         .allowsHitTesting(false)
                 }
 
@@ -1669,7 +1667,7 @@ struct ContentView: View {
                     Color.black.opacity(0.45)
                         .ignoresSafeArea()
                         .transition(.opacity)
-                    dialogShell(emoji: "💥", title: "太幸运了！",
+                    dialogShell(image: "加特林", emoji: "💥", glow: true, title: "太幸运了！",
                                 message: "你的奶蛙偶然捡到了加特林！已解锁，送你 5 次",
                                 primary: "收下", secondary: nil) {
                         withAnimation(.easeOut(duration: 0.2)) { economy.clearGatlingCelebration() }
@@ -1680,6 +1678,9 @@ struct ContentView: View {
             .animation(.spring(response: 0.35, dampingFraction: 0.78), value: economy.justDiscoveredGatling)
         }
         .statusBarHidden()
+        // Lock the whole UI to light mode so our black-on-white panels/pages
+        // stay legible regardless of the user's system appearance.
+        .preferredColorScheme(.light)
         .sheet(isPresented: $showDebug) {
             DebugPanel(voice: naiwa.voice, economy: economy, showHitZones: $showHitZones)
         }
@@ -1729,11 +1730,11 @@ struct ContentView: View {
     private var actionPanel: some View {
         // Hidden-tier assets (加特林) only appear once discovered.
         let items = NaiwaAction.catalog.filter { economy.isVisible($0.id, tier: $0.tier) }
-        return floatingPanel(caption: "点击播放 · 长按无限动作设为右手") {
+        return floatingPanel(caption: "长按无限动作可设为右手装配动作", itemCount: items.count) {
             ForEach(items) { action in
-                floatingItem(emoji: action.emoji,
-                             label: action.name,
-                             selected: action.id == naiwa.equippedActionId,
+                let isEquipped = action.id == naiwa.equippedActionId
+                floatingItem(image: action.image, emoji: action.emoji,
+                             selected: isEquipped, equipped: isEquipped,
                              badge: actionBadge(action),
                              onTap: { handleActionTap(action) },
                              onLongPress: { handleActionLongPress(action) })
@@ -1742,11 +1743,10 @@ struct ContentView: View {
     }
 
     private var voicePanel: some View {
-        floatingPanel(caption: "点击切换音色") {
+        floatingPanel(caption: "点击切换音色", itemCount: NaiwaVoiceProfile.all.count) {
             ForEach(NaiwaVoiceProfile.all) { profile in
-                floatingItem(emoji: profile.emoji,
-                             label: profile.name,
-                             selected: profile.id == naiwa.voice.selectedVoiceId,
+                floatingItem(image: nil, emoji: profile.emoji,   // voice images not ready → emoji
+                             selected: profile.id == naiwa.voice.selectedVoiceId, equipped: false,
                              badge: voiceBadge(profile),
                              onTap: { handleVoiceTap(profile) })
             }
@@ -1790,8 +1790,16 @@ struct ContentView: View {
         }
     }
 
-    /// Long-press equips to the right hand — only ∞ actions are equippable.
+    /// Long-press toggles the right-hand equip. Only ∞ actions are equippable;
+    /// long-pressing the equipped one again unequips it (right zone → 挠头).
     private func handleActionLongPress(_ a: NaiwaAction) {
+        if naiwa.equippedActionId == a.id {
+            naiwa.equippedActionId = ""
+            impact()
+            closePanels()
+            showToast("已取消装备 · 右手恢复默认")
+            return
+        }
         guard isInfiniteAction(a) else {
             impact()
             showToast("无限次的动作才能装备到右手")
@@ -1800,7 +1808,7 @@ struct ContentView: View {
         naiwa.equippedActionId = a.id
         impact()
         closePanels()
-        showToast("\(a.emoji) \(a.name) 已设为右手动作")
+        showToast("\(a.name) 已装备到右手")
     }
 
     private func handleVoiceTap(_ v: NaiwaVoiceProfile) {
@@ -1857,13 +1865,11 @@ struct ContentView: View {
         withAnimation(.easeOut(duration: 0.18)) { assetDialog = nil }
     }
 
-    /// After a successful unlock/refill, immediately use the asset: actions play
-    /// (consuming one use), voices apply. Keeps the flow one-tap.
-    private func postUnlockUse(_ id: String) {
-        if NaiwaAction.byId(id) != nil {
-            economy.consumeUse(id)
-            naiwa.playAction(id)
-        } else if let v = NaiwaVoiceProfile.all.first(where: { $0.id == id }) {
+    /// After a successful unlock/refill: select voices, but DON'T auto-play
+    /// actions — let the user trigger them so奶蛙 feels alive, not like a media
+    /// player. The granted uses stay intact for the user's own first tap.
+    private func postUnlock(_ id: String) {
+        if let v = NaiwaVoiceProfile.all.first(where: { $0.id == id }) {
             naiwa.voice.applyVoiceProfile(v)
         }
     }
@@ -1872,30 +1878,36 @@ struct ContentView: View {
     private func assetDialogCard(_ d: AssetDialog) -> some View {
         switch d {
         case .unlock(let id, let name, let emoji):
-            dialogShell(emoji: emoji, title: "解锁 \(name)",
+            dialogShell(image: NaiwaAction.byId(id)?.image, emoji: emoji, title: "解锁 \(name)",
                         message: "花 \(Economy.freeUnlockCost) 🪙 解锁，先送你 \(Economy.freeUnlockUses) 次",
                         primary: "花 \(Economy.freeUnlockCost) 🪙 解锁", secondary: "以后再说") {
-                if economy.unlockFree(id) { postUnlockUse(id); dismissDialog() }
-                else { withAnimation { assetDialog = .notEnough(needed: Economy.freeUnlockCost) } }
+                if economy.unlockFree(id) {
+                    postUnlock(id); dismissDialog()
+                    showToast("已解锁 \(name) · 送你 \(Economy.freeUnlockUses) 次")
+                } else { withAnimation { assetDialog = .notEnough(needed: Economy.freeUnlockCost) } }
             }
         case .unlockPermanent(let id, let name, let emoji):
-            dialogShell(emoji: emoji, title: "解锁 \(name)",
+            dialogShell(image: NaiwaAction.byId(id)?.image, emoji: emoji, title: "解锁 \(name)",
                         message: "花 \(Economy.freeUnlockCost) 🪙 永久解锁 \(name)，之后随便用",
                         primary: "花 \(Economy.freeUnlockCost) 🪙 永久解锁", secondary: "以后再说") {
-                if economy.unlockPermanent(id) { postUnlockUse(id); dismissDialog() }
-                else { withAnimation { assetDialog = .notEnough(needed: Economy.freeUnlockCost) } }
+                if economy.unlockPermanent(id) {
+                    postUnlock(id); dismissDialog()
+                    showToast("已永久解锁 \(name)")
+                } else { withAnimation { assetDialog = .notEnough(needed: Economy.freeUnlockCost) } }
             }
         case .refill(let id, let name, let emoji):
-            dialogShell(emoji: emoji, title: "\(name) 次数用完了",
+            dialogShell(image: NaiwaAction.byId(id)?.image, emoji: emoji, title: "\(name) 次数用完了",
                         message: "花 \(Economy.refillCost) 🪙 再来 \(Economy.refillUses) 次",
                         primary: "花 \(Economy.refillCost) 🪙 购买", secondary: "以后再说") {
-                if economy.refill(id) { postUnlockUse(id); dismissDialog() }
-                else { withAnimation { assetDialog = .notEnough(needed: Economy.refillCost) } }
+                if economy.refill(id) {
+                    postUnlock(id); dismissDialog()
+                    showToast("已充值 · 再来 \(Economy.refillUses) 次")
+                } else { withAnimation { assetDialog = .notEnough(needed: Economy.refillCost) } }
             }
         case .founder(_, let name, let emoji):
             let price = store.displayPrice(StoreManager.ProductID.gunPack)
-            dialogShell(emoji: emoji, title: "创始人限定 · \(name)",
-                        message: "创始人礼包，永久无限次\(price.isEmpty ? "" : "（\(price)）")，限时开放。",
+            dialogShell(image: "打枪礼包", emoji: emoji, glow: true, title: "创始人礼包 · \(name)",
+                        message: "解锁后永久无限次\(name)\(price.isEmpty ? "" : "（\(price)）")，并可长按装备到右手。",
                         primary: store.isBusy ? "购买中…" : (price.isEmpty ? "解锁" : "\(price) 解锁"),
                         secondary: "以后再说") {
                 Task {
@@ -1912,83 +1924,115 @@ struct ContentView: View {
         }
     }
 
-    private func dialogShell(emoji: String, title: String, message: String,
+    private func dialogShell(image: String? = nil, emoji: String, glow: Bool = false,
+                             title: String, message: String,
                              primary: String, secondary: String?,
                              onPrimary: @escaping () -> Void) -> some View {
         VStack(spacing: 14) {
-            Text(emoji).font(.system(size: 44))
+            Group {
+                if let image {
+                    Image(image).resizable().scaledToFit().frame(width: 84, height: 84)
+                } else {
+                    Text(emoji).font(.system(size: 44))
+                }
+            }
+            .background { if glow { giftGlow(124) } }
             Text(title).font(.system(size: 18, weight: .bold)).foregroundColor(.primary)
             Text(message).font(.system(size: 14)).foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
             VStack(spacing: 8) {
                 Button(action: onPrimary) {
                     Text(primary).font(.system(size: 16, weight: .semibold))
-                        .frame(maxWidth: .infinity).padding(.vertical, 12)
-                        .background(Color.accentColor).foregroundColor(.white)
-                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .frame(maxWidth: .infinity).padding(.vertical, 13)
+                        .background(Color.black).foregroundColor(.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
                 }
                 if let secondary {
                     Button(action: dismissDialog) {
                         Text(secondary).font(.system(size: 15))
-                            .frame(maxWidth: .infinity).padding(.vertical, 10)
+                            .frame(maxWidth: .infinity).padding(.vertical, 9)
                             .foregroundColor(.secondary)
                     }
                 }
             }
-            .padding(.top, 2)
+            .padding(.top, 4)
         }
-        .padding(20)
-        .frame(width: 284)
-        .background(RoundedRectangle(cornerRadius: 24, style: .continuous).fill(.regularMaterial))
-        .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
-        .shadow(color: .black.opacity(0.3), radius: 24, y: 10)
+        .padding(22)
+        .frame(width: 286)
+        .background(RoundedRectangle(cornerRadius: 26, style: .continuous).fill(Color(red: 1.0, green: 0.99, blue: 0.97)))
+        .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).stroke(Color.black.opacity(0.05), lineWidth: 1))
+        .shadow(color: .black.opacity(0.28), radius: 26, y: 12)
     }
 
     /// Rounded frosted card holding a row of items + a caption. Shared by both
     /// panels so 动作 and 音色 look identical.
-    private func floatingPanel<Content: View>(caption: String,
+    /// Frosted card with a 2-per-row grid of item tiles (scrolls past 3 rows) +
+    /// a caption. `itemCount` sizes the scroll area so the card hugs its content.
+    private func floatingPanel<Content: View>(caption: String, itemCount: Int,
                                               @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) { content() }
+        let tile: CGFloat = 84, colGap: CGFloat = 14, rowGap: CGFloat = 16
+        let columns = [GridItem(.fixed(tile), spacing: colGap), GridItem(.fixed(tile), spacing: colGap)]
+        let rows = Int(ceil(Double(max(itemCount, 1)) / 2.0))
+        let visibleRows = min(rows, 3)
+        let gridHeight = CGFloat(visibleRows) * tile + CGFloat(max(0, visibleRows - 1)) * rowGap
+        let pad: CGFloat = 8   // room so corner badges / rings aren't clipped by the scroll view
+        return VStack(alignment: .leading, spacing: 10) {
+            ScrollView(.vertical, showsIndicators: false) {
+                LazyVGrid(columns: columns, spacing: rowGap) { content() }
+                    .padding(pad)
+            }
+            .frame(width: tile * 2 + colGap + pad * 2, height: gridHeight + pad * 2)
             Text(caption)
-                .font(.system(size: 10))
-                .foregroundColor(.secondary)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.black.opacity(0.4))
+                .padding(.leading, 2)
         }
-        .padding(12)
+        .padding(16)
         .background(
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .fill(.regularMaterial)
+            RoundedRectangle(cornerRadius: 26, style: .continuous)
+                .fill(Color(red: 1.0, green: 0.99, blue: 0.97))
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .stroke(Color.white.opacity(0.18), lineWidth: 0.5)
+            RoundedRectangle(cornerRadius: 26, style: .continuous)
+                .stroke(Color.black.opacity(0.05), lineWidth: 1)
         )
-        .shadow(color: .black.opacity(0.28), radius: 16, y: 8)
+        .shadow(color: .black.opacity(0.22), radius: 22, y: 12)
     }
 
-    /// One selectable item chip (emoji over label + a state badge). Tap fires
-    /// `onTap`; an optional long-press fires `onLongPress` (used by 动作 to equip).
-    private func floatingItem(emoji: String, label: String, selected: Bool,
+    /// One selectable item tile — just its Assets image (or emoji fallback), a
+    /// state badge (top-right), and a 装配中 tag (top-left) when equipped. No
+    /// text name. Tap fires `onTap`; long-press fires `onLongPress` (equip).
+    private func floatingItem(image: String?, emoji: String,
+                              selected: Bool, equipped: Bool,
                               badge: ItemBadge,
                               onTap: @escaping () -> Void,
                               onLongPress: (() -> Void)? = nil) -> some View {
-        VStack(spacing: 4) {
-            Text(emoji).font(.system(size: 34))
-            Text(label)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundColor(.primary)
+        ZStack {
+            RoundedRectangle(cornerRadius: 19, style: .continuous)
+                .fill(selected ? Color.black.opacity(0.06) : Color.black.opacity(0.035))
+            if let image {
+                Image(image).resizable().scaledToFit().padding(9)
+            } else {
+                Text(emoji).font(.system(size: 40))
+            }
         }
-        .frame(width: 76, height: 78)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(selected ? Color.accentColor.opacity(0.18) : Color.primary.opacity(0.06))
-        )
+        .frame(width: 84, height: 84)
         .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(selected ? Color.accentColor : .clear, lineWidth: 2)
+            RoundedRectangle(cornerRadius: 19, style: .continuous)
+                .strokeBorder(selected ? Color.black : Color.clear, lineWidth: 2)
         )
         .overlay(alignment: .topTrailing) { badgeView(badge) }
-        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(alignment: .bottom) {
+            if equipped {
+                Text("装配中")
+                    .font(.system(size: 9, weight: .heavy))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(Capsule().fill(Color.black))
+                    .padding(.bottom, 5)
+            }
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 19, style: .continuous))
         .onTapGesture { onTap() }
         .onLongPressGesture(minimumDuration: 0.35) { onLongPress?() }
     }
@@ -2051,7 +2095,7 @@ struct ContentView: View {
     /// (the previous auto-dismiss task is cancelled).
     private func showToast(_ text: String) {
         toastTask?.cancel()
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) { toast = text }
+        withAnimation(.easeOut(duration: 0.22)) { toast = text }
         toastTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 1_600_000_000)
             guard !Task.isCancelled else { return }
@@ -2066,28 +2110,64 @@ struct ContentView: View {
             economy.flushCompanion()
             withAnimation(.easeInOut(duration: 0.15)) { showTasks = true }
         } label: {
-            HStack(spacing: 5) {
-                coinIcon(16)
+            HStack(spacing: 6) {
+                coinIcon(22)
                 Text("\(economy.coins)")
-                    .font(.system(size: 15, weight: .bold, design: .rounded))
+                    .font(.system(size: 18, weight: .bold, design: .rounded))
                     .foregroundColor(.white)
                     .contentTransition(.numericText())
             }
-            // Badge sits on the content (not the capsule edge) so it hugs the
-            // number instead of drifting out past the trailing padding.
+            // No background — the black sky + earth should show through. A soft
+            // shadow keeps it legible over both.
+            .shadow(color: .black.opacity(0.55), radius: 3, x: 0, y: 1)
             .overlay(alignment: .topTrailing) {
                 if economy.claimableTaskCount > 0 {
                     Circle().fill(Color.red)
-                        .frame(width: 7, height: 7)
+                        .frame(width: 6, height: 6)
                         .overlay(Circle().stroke(Color.white.opacity(0.9), lineWidth: 0.5))
-                        .offset(x: 5, y: -4)
+                        .offset(x: 4, y: -3)
                 }
             }
-            .padding(.horizontal, 12)
+            .padding(.horizontal, 6)
             .padding(.vertical, 6)
-            .background(Capsule().fill(Color.black.opacity(0.32)))
+            .contentShape(Rectangle())
         }
         .animation(.snappy, value: economy.coins)
+    }
+
+    /// Compact founder-pack entry above the 动作 button — a 🎁 that wiggles every
+    /// few seconds to draw the eye.
+    private var founderTile: some View {
+        Button {
+            presentDialog(.founder(id: "gun", name: "打枪", emoji: "🔫"))
+        } label: {
+            Image("打枪礼包")
+                .resizable()
+                .scaledToFit()
+                .frame(width: 50, height: 50)
+                .background(giftGlow(64))
+                .phaseAnimator([0.0, -7, 5, -3, 0], trigger: giftBeat) { view, angle in
+                    view.rotationEffect(.degrees(angle), anchor: .bottom)
+                } animation: { _ in .easeInOut(duration: 0.13) }
+        }
+        .task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 6_000_000_000)
+                giftBeat += 1
+            }
+        }
+    }
+
+    /// Soft warm bloom behind an icon. Single hue + wide falloff + blur reads as
+    /// ambient light, not a solid blob.
+    private func giftGlow(_ d: CGFloat) -> some View {
+        Circle()
+            .fill(RadialGradient(
+                gradient: Gradient(colors: [Color(red: 1.0, green: 0.86, blue: 0.5).opacity(0.65), .clear]),
+                center: .center, startRadius: 0, endRadius: d * 0.5))
+            .frame(width: d, height: d)
+            .blur(radius: d * 0.12)
+            .allowsHitTesting(false)
     }
 
     /// The 奶币 coin image (transparent PNG in Assets), sized square.
@@ -2099,13 +2179,12 @@ struct ContentView: View {
     /// circle (label dropped for a cleaner screen; the icon + opened panel are
     /// self-explanatory, and more category buttons are coming). Shared so every
     /// corner button stays visually identical.
-    private func bottomChromeButton(_ symbol: String, action: @escaping () -> Void) -> some View {
+    private func bottomChromeButton(_ emoji: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Image(systemName: symbol)
-                .font(.system(size: 24, weight: .semibold))
-                .foregroundColor(.white)
+            Text(emoji)
+                .font(.system(size: 27))
                 .frame(width: 56, height: 56)
-                .background(Color.black.opacity(0.30))
+                .background(Color.black.opacity(0.7))
                 .clipShape(Circle())
         }
     }
@@ -2117,6 +2196,18 @@ struct ContentView: View {
                 .font(.system(size: size, weight: .semibold))
                 .foregroundColor(.white.opacity(0.78))
                 .padding(9)
+                .background(Color.black.opacity(0.28))
+                .clipShape(Circle())
+        }
+    }
+
+    /// Emoji variant of the top-chrome round button (keeps the main-screen icons
+    /// consistently emoji).
+    private func circleEmojiButton(_ emoji: String, size: CGFloat, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(emoji)
+                .font(.system(size: size))
+                .padding(8)
                 .background(Color.black.opacity(0.28))
                 .clipShape(Circle())
         }

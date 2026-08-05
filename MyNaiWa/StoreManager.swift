@@ -17,7 +17,8 @@ final class StoreManager: ObservableObject {
     enum ProductID {
         static let gunPack = "lxxdesign.MyNaiWa.founderpack.gun"
         static let milkTea = "lxxdesign.MyNaiWa.tip.milktea"
-        static let all = [gunPack, milkTea]
+        static let food    = "lxxdesign.MyNaiWa.tip.food"
+        static let all = [gunPack, milkTea, food]
     }
 
     @Published private(set) var products: [Product] = []
@@ -87,7 +88,7 @@ final class StoreManager: ObservableObject {
     private func grant(_ transaction: Transaction) async {
         switch transaction.productID {
         case ProductID.gunPack: onGunOwned?()
-        case ProductID.milkTea: break   // consumable tip → grants nothing
+        case ProductID.milkTea, ProductID.food: break   // consumable tips → grant nothing
         default: break
         }
     }

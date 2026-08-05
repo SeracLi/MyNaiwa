@@ -20,21 +20,20 @@ struct TaskCenterView: View {
 
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: 0) {
-                    // Balance header
+                    // Balance header — big coin above the number.
                     VStack(spacing: 6) {
-                        HStack(spacing: 8) {
-                            Image("奶币").resizable().scaledToFit().frame(width: 30, height: 30)
-                            Text("\(economy.coins)")
-                                .font(.system(size: 34, weight: .bold, design: .rounded))
-                                .foregroundColor(.black)
-                                .contentTransition(.numericText())
-                        }
-                        Text("完成任务赚奶币，解锁更多动作和音色")
+                        Image("奶币").resizable().scaledToFit().frame(width: 60, height: 60)
+                        Text("\(economy.coins)")
+                            .font(.system(size: 32, weight: .bold, design: .rounded))
+                            .foregroundColor(.black)
+                            .contentTransition(.numericText())
+                        Text("完成活动赚奶币，解锁更多动作和音色")
                             .font(.system(size: 13))
                             .foregroundColor(.gray)
+                            .padding(.top, 2)
                     }
-                    .padding(.top, 16)
-                    .padding(.bottom, 20)
+                    .padding(.top, 24)
+                    .padding(.bottom, 26)
 
                     // Daily tasks
                     VStack(spacing: 0) {
@@ -65,7 +64,7 @@ struct TaskCenterView: View {
                 }
             }
             ToolbarItem(placement: .principal) {
-                Text("任务中心")
+                Text("活动中心")
                     .font(.system(size: 18, weight: .semibold))
                     .foregroundColor(.black)
             }
@@ -114,7 +113,7 @@ struct TaskCenterView: View {
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundColor(.white)
                     .frame(width: 70, height: 32)
-                    .background(Capsule().fill(Color.accentColor))
+                    .background(Capsule().fill(Color.black))
             }
         } else {
             Text("进行中")

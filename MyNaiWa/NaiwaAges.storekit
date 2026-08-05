@@ -31,6 +31,21 @@
       "productID" : "lxxdesign.MyNaiWa.tip.milktea",
       "referenceName" : "Milk Tea Tip",
       "type" : "Consumable"
+    },
+    {
+      "displayPrice" : "1.99",
+      "familyShareable" : false,
+      "internalID" : "1003",
+      "localizations" : [
+        {
+          "description" : "请奶蛙吃顿好的，纯感谢，不解锁任何内容",
+          "displayName" : "请奶蛙吃美食",
+          "locale" : "zh_CN"
+        }
+      ],
+      "productID" : "lxxdesign.MyNaiWa.tip.food",
+      "referenceName" : "Food Tip",
+      "type" : "Consumable"
     }
   ],
   "settings" : {

@@ -38,7 +38,15 @@ struct SettingsView: View {
 
     @Environment(\.horizontalSizeClass) private var hSizeClass
     @State private var showShareSheet = false
-    @State private var showTipThanks = false
+    @State private var showTipChooser = false
+    @State private var thanksKind: TipKind?
+
+    /// Which tip was just paid — drives the (differentiated) thank-you card.
+    private enum TipKind {
+        case milktea, food
+        var image: String { self == .milktea ? "打赏奶茶" : "打赏美食" }
+        var title: String { self == .milktea ? "谢谢你的奶茶 🧋" : "谢谢你的美食 😋" }
+    }
 
     /// 奶蛙时代's App Store id.
     private static let appStoreId = "6796403986"
@@ -68,15 +76,9 @@ struct SettingsView: View {
 
                         divider
 
-                        divider
-
                         // Tip + restore
-                        settingsRow(emoji: "🧋", title: "请奶蛙喝奶茶") {
-                            Task {
-                                if await store.purchase(StoreManager.ProductID.milkTea) {
-                                    showTipThanks = true
-                                }
-                            }
+                        settingsRow(emoji: "🍰", title: "请奶蛙吃点好的") {
+                            withAnimation(.easeOut(duration: 0.18)) { showTipChooser = true }
                         }
                         settingsRow(emoji: "🔄", title: "恢复购买") {
                             Task { await store.restore() }
@@ -104,6 +106,61 @@ struct SettingsView: View {
                         .padding(.bottom, 32)
                 }
             }
+
+            // Tip chooser — 奶茶 or 美食, each with its designed image + price.
+            if showTipChooser {
+                Color.black.opacity(0.35).ignoresSafeArea()
+                    .transition(.opacity)
+                    .onTapGesture { withAnimation(.easeOut(duration: 0.15)) { showTipChooser = false } }
+                VStack(spacing: 18) {
+                    Text("请奶蛙吃点好的 💛")
+                        .font(.system(size: 17, weight: .bold)).foregroundColor(.black)
+                    HStack(spacing: 16) {
+                        tipOption(image: "打赏奶茶", title: "喝奶茶",
+                                  id: StoreManager.ProductID.milkTea, fallback: "¥6")
+                        tipOption(image: "打赏美食", title: "吃美食",
+                                  id: StoreManager.ProductID.food, fallback: "¥12")
+                    }
+                    Button("以后再说") {
+                        withAnimation(.easeOut(duration: 0.15)) { showTipChooser = false }
+                    }
+                    .font(.system(size: 15)).foregroundColor(.secondary)
+                }
+                .padding(24)
+                .background(RoundedRectangle(cornerRadius: 26, style: .continuous).fill(Color(red: 1.0, green: 0.99, blue: 0.97)))
+                .shadow(color: .black.opacity(0.28), radius: 26, y: 12)
+                .padding(.horizontal, 40)
+                .transition(.scale(scale: 0.88).combined(with: .opacity))
+            }
+
+            // Differentiated thank-you card — big image, vertically centered.
+            if let kind = thanksKind {
+                Color.black.opacity(0.4).ignoresSafeArea()
+                    .transition(.opacity)
+                    .onTapGesture { withAnimation(.easeOut(duration: 0.15)) { thanksKind = nil } }
+                VStack(spacing: 16) {
+                    Image(kind.image).resizable().scaledToFit().frame(width: 112, height: 112)
+                    Text(kind.title)
+                        .font(.system(size: 19, weight: .bold)).foregroundColor(.black)
+                    Text("奶蛙收到啦，抱抱你！\n你的支持是它穿越更多时代的动力 💛")
+                        .font(.system(size: 14)).foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                    Button {
+                        withAnimation(.easeOut(duration: 0.15)) { thanksKind = nil }
+                    } label: {
+                        Text("不客气~")
+                            .font(.system(size: 16, weight: .semibold)).foregroundColor(.white)
+                            .frame(maxWidth: .infinity).padding(.vertical, 12)
+                            .background(Color.black)
+                            .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+                    }
+                }
+                .padding(24)
+                .frame(width: 286)
+                .background(RoundedRectangle(cornerRadius: 26, style: .continuous).fill(Color(red: 1.0, green: 0.99, blue: 0.97)))
+                .shadow(color: .black.opacity(0.28), radius: 26, y: 12)
+                .transition(.scale(scale: 0.88).combined(with: .opacity))
+            }
         }
         .navigationBarBackButtonHidden(true)
         .navigationBarTitleDisplayMode(.inline)
@@ -125,11 +182,6 @@ struct SettingsView: View {
         }
         .sheet(isPresented: $showShareSheet) {
             ShareSheet(items: [URL(string: Self.appStoreURL)!])
-        }
-        .alert("谢谢你的奶茶 🧋", isPresented: $showTipThanks) {
-            Button("不客气~", role: .cancel) {}
-        } message: {
-            Text("奶蛙收到啦，抱抱你！你的支持是它穿越更多时代的动力 💛")
         }
     }
 
@@ -161,6 +213,30 @@ struct SettingsView: View {
             .frame(height: 0.5)
             .padding(.horizontal, hSizeClass == .regular ? 24 : 32)
             .padding(.vertical, 4)
+    }
+
+    /// One tip choice (奶茶 / 美食) — image + name + price, buys on tap.
+    private func tipOption(image: String, title: String, id: String, fallback: String) -> some View {
+        let price = store.displayPrice(id)
+        return Button {
+            Task {
+                if await store.purchase(id) {
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        showTipChooser = false
+                        thanksKind = (id == StoreManager.ProductID.milkTea) ? .milktea : .food
+                    }
+                }
+            }
+        } label: {
+            VStack(spacing: 8) {
+                Image(image).resizable().scaledToFit().frame(width: 74, height: 74)
+                Text(title).font(.system(size: 15, weight: .semibold)).foregroundColor(.black)
+                Text(price.isEmpty ? fallback : price)
+                    .font(.system(size: 13, weight: .medium)).foregroundColor(.secondary)
+            }
+            .frame(width: 108, height: 150)
+            .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Color.black.opacity(0.04)))
+        }
     }
 
     // MARK: Other Works — cross-promo to the developer's other apps
