@@ -799,6 +799,13 @@ final class NaiwaPlayer: ObservableObject {
     private var watchdog: DispatchWorkItem?
     private static let loopingClips: Set<NaiwaClip> = [.idle, .talkListen, .talkSpeak]
 
+    /// The high-frequency clips that stay resident + prerolled. Everything else
+    /// (the collectible action clips: 打枪/太极/太空服/加特林/面包) is created but
+    /// NOT prerolled at launch, and is torn down on a memory warning to keep the
+    /// footprint low on 3GB devices — it's rebuilt on demand via ensureLoaded.
+    private static let hotClips: Set<NaiwaClip> =
+        [.idle, .head, .belly, .laugh, .floating, .talkEnter, .talkListen, .talkSpeak, .talkExit]
+
     init() {
         for clip in NaiwaClip.allCases {
             let p = AVPlayer()
@@ -868,8 +875,10 @@ final class NaiwaPlayer: ObservableObject {
     /// Premiere). `preroll` fills buffers without advancing or making sound.
     private func prewarmDecoders() {
         for (clip, player) in players {
-            // idle is already playing (warm); everything else is paused.
-            guard clip != .idle, let item = player.currentItem else { continue }
+            // idle is already playing (warm). Only preroll the high-frequency hot
+            // clips — prerolling all 20 2K pipelines spikes launch memory and risks
+            // a jetsam kill on 3GB devices. Action clips warm lazily on first use.
+            guard clip != .idle, Self.hotClips.contains(clip), let item = player.currentItem else { continue }
             if item.status == .readyToPlay {
                 player.preroll(atRate: 1.0)
             } else {
@@ -943,7 +952,24 @@ final class NaiwaPlayer: ObservableObject {
             }
         }
 
-        lifecycleObservers = [bg, fg, interrupt, active]
+        // Free the collectible action clips' decode buffers under memory pressure
+        // so we don't get jetsam-killed on 3GB devices. They rebuild on demand.
+        let mem = NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.releaseNonHotItems() }
+        }
+
+        lifecycleObservers = [bg, fg, interrupt, active, mem]
+    }
+
+    /// Abort a talk session that's still "held" when the app leaves the active
+    /// state (a system layer can swallow the DragGesture's onEnded, stranding the
+    /// button red and recording to the 10s cap). Called on scenePhase change.
+    func abortTalkIfHeld() {
+        guard isButtonHeld || state.isInTalkMode else { return }
+        voice.recoverAudioSession()
+        recoverToIdle()
     }
 
     /// Returning from background, AVPlayerLayers often go blank — the render
@@ -1118,7 +1144,29 @@ final class NaiwaPlayer: ObservableObject {
 
     // MARK: Switch — crossfade visibility swap
 
+    /// Rebuild a clip's player item if it was torn down by a memory warning, so
+    /// switchTo can always play it. No-op if already loaded.
+    private func ensureLoaded(_ clip: NaiwaClip) {
+        guard players[clip]?.currentItem == nil, let url = url(for: clip) else { return }
+        let item = AVPlayerItem(url: url)
+        players[clip]?.replaceCurrentItem(with: item)
+        attachEndObserver(for: clip, item: item)
+    }
+
+    /// On a memory warning, drop the non-hot, non-current clips' items to free
+    /// their 2K decode buffers. They're rebuilt on demand by ensureLoaded.
+    private func releaseNonHotItems() {
+        for (clip, player) in players where clip != currentClip && !Self.hotClips.contains(clip) {
+            if let obs = endObservers[clip] {
+                NotificationCenter.default.removeObserver(obs)
+                endObservers[clip] = nil
+            }
+            player.replaceCurrentItem(with: nil)
+        }
+    }
+
     private func switchTo(_ next: NaiwaClip) {
+        ensureLoaded(next)
         let from = currentClip
 
         if next == from {
@@ -1938,6 +1986,7 @@ struct ContentView: View {
                 economy.beginCompanionSession()
             case .inactive, .background:
                 economy.endCompanionSession()
+                naiwa.abortTalkIfHeld()
             @unknown default:
                 break
             }
@@ -2008,6 +2057,10 @@ struct ContentView: View {
     // MARK: Panel tap handling (economy-gated)
 
     private func handleActionTap(_ a: NaiwaAction) {
+        // Don't spend a use / open a dialog while奶蛙 is mid-talk: playAction()
+        // no-ops during talk mode, so consuming first would burn a use with no
+        // playback (reachable by a multi-touch: hold record + tap a panel item).
+        guard !naiwa.state.isInTalkMode else { return }
         let p = economy.progress(a.id)
         switch a.tier {
         case .gift:

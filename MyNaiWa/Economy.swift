@@ -163,6 +163,14 @@ final class Economy: ObservableObject {
     private let key = "naiwa_economy_v1"
     private var cloudObserver: NSObjectProtocol?
 
+    /// True while the current data is only the provisional fresh-install seed
+    /// (starting coins, empty assets) written before iCloud has had a chance to
+    /// sync down. While fresh we DON'T push to iCloud (so we can't clobber a real
+    /// cloud save that just hasn't arrived) and we adopt any incoming cloud data
+    /// unconditionally. A grace timer promotes it to a real snapshot if the cloud
+    /// stays empty (genuine new user).
+    private var isFreshSnapshot = false
+
     init() {
         // Newest snapshot wins between the local copy and iCloud (single-user,
         // rare concurrent edits — whole-snapshot newest-wins avoids per-field
@@ -172,18 +180,25 @@ final class Economy: ObservableObject {
         if let best = [local, remote].compactMap({ $0 }).max(by: { $0.updatedAt < $1.updatedAt }) {
             apply(best)
         } else {
-            // Fresh install (no local + no cloud snapshot). Guard the starting
-            // grant against uninstall→reinstall farming with a keychain flag that
-            // survives app deletion: a reinstaller gets 0, a true new user gets 50.
-            if StartingGrant.isClaimed {
-                coins = 0
-            } else {
-                coins = Self.startingCoins
-                StartingGrant.markClaimed()
-            }
+            // No snapshot locally AND none from iCloud yet. This is either a
+            // genuine fresh install OR a returning user on a new device whose
+            // iCloud data simply hasn't synced down yet (KVS is asynchronous). We
+            // can't tell them apart here, so we seed starting coins as a
+            // PROVISIONAL, local-only snapshot marked fresh: if real cloud data
+            // arrives, adoptCloudIfNewer replaces it unconditionally; if it never
+            // does (true new user), a grace timer promotes it and pushes to cloud.
+            //
+            // We grant the starting coins even if the keychain anti-farm flag is
+            // set. With iCloud restore in place a returning user gets their real
+            // balance from the cloud, and leaving a legitimate reinstaller with 0
+            // coins (the old behavior) is a guaranteed 1-star review for a trivial
+            // farming upside.
+            coins = Self.startingCoins
+            StartingGrant.markClaimed()
             assets = [:]
             updatedAt = Date().timeIntervalSince1970
-            persist()
+            isFreshSnapshot = true
+            persist()   // local-only while fresh (see persist)
         }
         rolloverIfNeeded()
 
@@ -194,6 +209,18 @@ final class Economy: ObservableObject {
             Task { @MainActor [weak self] in self?.adoptCloudIfNewer() }
         }
         cloud.synchronize()
+
+        // If we're still on the provisional fresh seed after a grace period (no
+        // real cloud data ever arrived), promote it to a normal snapshot and push
+        // to iCloud so a genuine new user's progress is backed up.
+        if isFreshSnapshot {
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 8_000_000_000)
+                guard let self, self.isFreshSnapshot else { return }
+                self.isFreshSnapshot = false
+                self.persist()
+            }
+        }
     }
 
     deinit {
@@ -439,11 +466,17 @@ final class Economy: ObservableObject {
                             gatlingMiss: gatlingMiss, tipCounts: tipCounts)
         guard let data = try? JSONEncoder().encode(snap) else { return }
         defaults.set(data, forKey: key)
-        cloud.set(data, forKey: key)
+        // While still on the provisional fresh seed, do NOT push to iCloud — it
+        // would clobber a real cloud save that just hasn't synced down yet.
+        if !isFreshSnapshot { cloud.set(data, forKey: key) }
     }
 
     private func adoptCloudIfNewer() {
-        guard let remote = Self.decode(cloud.data(forKey: key)), remote.updatedAt > updatedAt else { return }
+        guard let remote = Self.decode(cloud.data(forKey: key)) else { return }
+        // Still on the provisional fresh seed → the cloud copy is the real save;
+        // adopt it unconditionally (our seed's `now` timestamp is meaningless).
+        if isFreshSnapshot { apply(remote); return }
+        guard remote.updatedAt > updatedAt else { return }
         apply(remote)
     }
 
@@ -458,6 +491,7 @@ final class Economy: ObservableObject {
         activeDays = s.activeDays ?? 0
         gatlingMiss = s.gatlingMiss ?? 0
         tipCounts = s.tipCounts ?? [:]
+        isFreshSnapshot = false   // adopting any real snapshot leaves the fresh state
     }
 
     private static func decode(_ data: Data?) -> Snapshot? {

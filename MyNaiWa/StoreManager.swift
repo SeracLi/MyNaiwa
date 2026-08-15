@@ -35,11 +35,18 @@ final class StoreManager: ObservableObject {
     /// `grant()` — the single point BOTH the purchase() return path and the async
     /// `Transaction.updates` listener funnel through — so the unlock (and its
     /// celebration) reaches the user no matter which path delivers the deal.
-    var onGunOwned: (() -> Void)?
+    var onGunOwned: (() -> Void)? { didSet { flushPendingGrants() } }
 
     /// Fired when a consumable tip (奶茶 / 美食) is paid — kind is "milktea"/"food".
     /// Also routed through `grant()`, so an async/deferred tip still counts.
-    var onTipPaid: ((String) -> Void)?
+    var onTipPaid: ((String) -> Void)? { didSet { flushPendingGrants() } }
+
+    /// Product IDs that were delivered before their callback was wired (e.g. an
+    /// unfinished transaction from a crashed session arrives via the listener
+    /// during init, before ContentView's .task assigns the callbacks). We buffer
+    /// them and replay once a callback is set — otherwise a consumable tip's count
+    /// would be finished-and-lost forever.
+    private var pendingGrants: [String] = []
 
     private var updatesTask: Task<Void, Never>?
 
@@ -121,12 +128,31 @@ final class StoreManager: ObservableObject {
     }
 
     private func grant(_ transaction: Transaction) async {
-        switch transaction.productID {
-        case ProductID.gunPack: onGunOwned?()
-        case ProductID.milkTea:  onTipPaid?("milktea")   // consumable: no entitlement,
-        case ProductID.food:     onTipPaid?("food")      // just acknowledge + count it
-        default: break
+        dispatchGrant(transaction.productID)
+    }
+
+    /// Route a delivered productID to its callback, or buffer it if the callback
+    /// isn't wired yet (see pendingGrants).
+    private func dispatchGrant(_ productID: String) {
+        switch productID {
+        case ProductID.gunPack:
+            if let cb = onGunOwned { cb() } else { pendingGrants.append(productID) }
+        case ProductID.milkTea:
+            if let cb = onTipPaid { cb("milktea") } else { pendingGrants.append(productID) }
+        case ProductID.food:
+            if let cb = onTipPaid { cb("food") } else { pendingGrants.append(productID) }
+        default:
+            break
         }
+    }
+
+    /// Replay buffered grants once a callback is assigned. Clears the buffer first
+    /// so anything still un-wired is simply re-buffered (no double-fire).
+    private func flushPendingGrants() {
+        guard !pendingGrants.isEmpty else { return }
+        let items = pendingGrants
+        pendingGrants = []
+        for id in items { dispatchGrant(id) }
     }
 
     private func listenForTransactions() -> Task<Void, Never> {
