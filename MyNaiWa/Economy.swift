@@ -145,6 +145,15 @@ final class Economy: ObservableObject {
     /// Transient (not persisted).
     @Published var justDiscoveredGatling = false
 
+    /// One-shot: a 礼包 just flipped from not-owned → owned (fresh purchase via
+    /// ANY path — sync return, async listener, or restore of a new deal) → show
+    /// the unlock celebration. Transient. Nil = nothing to celebrate.
+    @Published var justUnlockedPack: String? = nil
+
+    /// Lifetime tip counts, keyed "milktea"/"food" — powers the "已请客" badge so a
+    /// tip feels like it left a mark. Persisted.
+    @Published private(set) var tipCounts: [String: Int] = [:]
+
     /// In-memory only: when the current foreground "companion" session started.
     private var companionStart: Date?
 
@@ -249,10 +258,23 @@ final class Economy: ObservableObject {
         mutate(id) { $0.previewsUsed += 1 }
     }
 
-    /// 礼包 IAP finished → own it forever.
+    /// 礼包 IAP finished → own it forever. Fires the one-shot celebration ONLY on
+    /// the not-owned → owned transition, so re-granting from entitlements on every
+    /// launch (which also calls this) stays silent.
     func markPackOwned(_ id: String) {
+        let wasOwned = progress(id).infinite
         mutate(id) { $0.unlocked = true; $0.infinite = true }
+        if !wasOwned { justUnlockedPack = id }
     }
+
+    func clearPackCelebration() { justUnlockedPack = nil }
+
+    /// A tip (奶茶 / 美食) was paid — bump its lifetime count.
+    func recordTip(_ kind: String) {
+        tipCounts[kind, default: 0] += 1
+        bump()
+    }
+    func tipCount(_ kind: String) -> Int { tipCounts[kind] ?? 0 }
 
     /// 隐藏 triggered → reveal + grant the initial 5 uses.
     func discoverHidden(_ id: String) {
@@ -373,6 +395,8 @@ final class Economy: ObservableObject {
         activeDays = 0
         gatlingMiss = 0
         justDiscoveredGatling = false
+        justUnlockedPack = nil
+        tipCounts = [:]
         tasksDay = ""
         rolloverIfNeeded()   // → tasksDay=today, activeDays=1, persists
     }
@@ -412,7 +436,7 @@ final class Economy: ObservableObject {
         let snap = Snapshot(coins: coins, assets: assets, updatedAt: updatedAt,
                             tasksDay: tasksDay, taskProgress: taskProgress, taskClaimed: taskClaimed,
                             lifetimeInteractions: lifetimeInteractions, activeDays: activeDays,
-                            gatlingMiss: gatlingMiss)
+                            gatlingMiss: gatlingMiss, tipCounts: tipCounts)
         guard let data = try? JSONEncoder().encode(snap) else { return }
         defaults.set(data, forKey: key)
         cloud.set(data, forKey: key)
@@ -433,6 +457,7 @@ final class Economy: ObservableObject {
         lifetimeInteractions = s.lifetimeInteractions ?? 0
         activeDays = s.activeDays ?? 0
         gatlingMiss = s.gatlingMiss ?? 0
+        tipCounts = s.tipCounts ?? [:]
     }
 
     private static func decode(_ data: Data?) -> Snapshot? {
@@ -451,5 +476,6 @@ final class Economy: ObservableObject {
         var lifetimeInteractions: Int?
         var activeDays: Int?
         var gatlingMiss: Int?
+        var tipCounts: [String: Int]?
     }
 }

@@ -21,12 +21,25 @@ final class StoreManager: ObservableObject {
         static let all = [gunPack, milkTea, food]
     }
 
+    /// Outcome of a purchase attempt. We distinguish these so the UI can react
+    /// correctly: only `.failed` deserves an error prompt, `.cancelled` is silent,
+    /// and `.pending` means the reward arrives later via the transaction listener
+    /// (Ask-to-Buy / deferred), so we tell the user to wait rather than nothing.
+    enum PurchaseResult { case success, cancelled, pending, failed }
+
     @Published private(set) var products: [Product] = []
     @Published private(set) var isBusy = false
 
     /// Fired when the founder gun pack is owned (fresh purchase, restore, or a
-    /// transaction pushed from another device) → grant infinite 打枪.
+    /// transaction pushed from another device) → grant infinite 打枪. It fires from
+    /// `grant()` — the single point BOTH the purchase() return path and the async
+    /// `Transaction.updates` listener funnel through — so the unlock (and its
+    /// celebration) reaches the user no matter which path delivers the deal.
     var onGunOwned: (() -> Void)?
+
+    /// Fired when a consumable tip (奶茶 / 美食) is paid — kind is "milktea"/"food".
+    /// Also routed through `grant()`, so an async/deferred tip still counts.
+    var onTipPaid: ((String) -> Void)?
 
     private var updatesTask: Task<Void, Never>?
 
@@ -45,28 +58,41 @@ final class StoreManager: ObservableObject {
         catch { print("⚠️ StoreKit load: \(error)") }
     }
 
-    /// Buy a product. Returns true only on a verified, completed purchase.
+    /// Buy a product. The result tells the caller exactly what happened so it can
+    /// give the right feedback (success celebration / silent cancel / "processing"
+    /// / error) instead of the old silent no-op that read like a broken app.
     @discardableResult
-    func purchase(_ id: String) async -> Bool {
+    func purchase(_ id: String) async -> PurchaseResult {
         if product(id) == nil { await loadProducts() }
-        guard let product = product(id) else { return false }
+        guard let product = product(id) else { return .failed }
         isBusy = true
         defer { isBusy = false }
         do {
             switch try await product.purchase() {
             case .success(let verification):
-                guard case .verified(let transaction) = verification else { return false }
-                await grant(transaction)
-                await transaction.finish()
-                return true
-            case .userCancelled, .pending:
-                return false
+                switch verification {
+                case .verified(let transaction):
+                    await grant(transaction)
+                    await transaction.finish()
+                    return .success
+                case .unverified(let transaction, _):
+                    // Don't grant an unverified deal, but finish it so it stops
+                    // replaying through Transaction.updates forever.
+                    await transaction.finish()
+                    return .failed
+                }
+            case .userCancelled:
+                return .cancelled
+            case .pending:
+                // Deferred (Ask-to-Buy, SCA, etc.). It'll land later in the
+                // listener, which grants + celebrates then.
+                return .pending
             @unknown default:
-                return false
+                return .failed
             }
         } catch {
             print("⚠️ purchase: \(error)")
-            return false
+            return .failed
         }
     }
 
@@ -97,7 +123,8 @@ final class StoreManager: ObservableObject {
     private func grant(_ transaction: Transaction) async {
         switch transaction.productID {
         case ProductID.gunPack: onGunOwned?()
-        case ProductID.milkTea, ProductID.food: break   // consumable tips → grant nothing
+        case ProductID.milkTea:  onTipPaid?("milktea")   // consumable: no entitlement,
+        case ProductID.food:     onTipPaid?("food")      // just acknowledge + count it
         default: break
         }
     }
@@ -105,9 +132,16 @@ final class StoreManager: ObservableObject {
     private func listenForTransactions() -> Task<Void, Never> {
         Task { [weak self] in
             for await update in Transaction.updates {
-                guard case .verified(let transaction) = update else { continue }
-                await self?.grant(transaction)
-                await transaction.finish()
+                switch update {
+                case .verified(let transaction):
+                    await self?.grant(transaction)
+                    await transaction.finish()
+                case .unverified(let transaction, _):
+                    // Finish so it doesn't replay endlessly; never grant it.
+                    await transaction.finish()
+                @unknown default:
+                    break
+                }
             }
         }
     }

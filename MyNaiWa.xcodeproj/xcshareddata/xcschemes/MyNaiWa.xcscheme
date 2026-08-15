@@ -51,9 +51,6 @@
             ReferencedContainer = "container:MyNaiWa.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
-      <StoreKitConfigurationFileReference
-         identifier = "../../MyNaiWa/NaiwaAges.storekit">
-      </StoreKitConfigurationFileReference>
    </LaunchAction>
    <ProfileAction
       buildConfiguration = "Release"

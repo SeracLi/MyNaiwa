@@ -32,6 +32,8 @@ struct ShareSheet: UIViewControllerRepresentable {
 
 struct SettingsView: View {
     @ObservedObject var store: StoreManager
+    /// Drives the "已请客" tip badge + per-kind counts in the chooser.
+    @ObservedObject var economy: Economy
     /// Called by the back button. Passed in (rather than using `\.dismiss`) so
     /// the host can show/hide the page instantly instead of the sheet slide.
     let onClose: () -> Void
@@ -40,13 +42,27 @@ struct SettingsView: View {
     @State private var showShareSheet = false
     @State private var showTipChooser = false
     @State private var thanksKind: TipKind?
-    @State private var restoreMsg: String?
+    /// One shared notice alert for restore + tip outcomes (pending / failed).
+    @State private var noticeMsg: String?
 
     /// Which tip was just paid — drives the (differentiated) thank-you card.
     private enum TipKind {
         case milktea, food
         var image: String { self == .milktea ? "打赏奶茶" : "打赏美食" }
         var title: String { self == .milktea ? "谢谢你的奶茶 🧋" : "谢谢你的美食 😋" }
+    }
+
+    private func tipCount(_ kind: TipKind) -> Int {
+        economy.tipCount(kind == .milktea ? "milktea" : "food")
+    }
+    /// "已请客 奶茶×1 · 美食×2" — nil until at least one tip has been paid.
+    private var tipSummary: String? {
+        let m = tipCount(.milktea), f = tipCount(.food)
+        guard m + f > 0 else { return nil }
+        var parts: [String] = []
+        if m > 0 { parts.append("奶茶×\(m)") }
+        if f > 0 { parts.append("美食×\(f)") }
+        return "已请客 " + parts.joined(separator: " · ")
     }
 
     /// 奶蛙时代's App Store id.
@@ -80,13 +96,13 @@ struct SettingsView: View {
                         divider
 
                         // Tip + restore
-                        settingsRow(emoji: "🍰", title: "请奶蛙吃点好的") {
+                        settingsRow(emoji: "🍰", title: "请奶蛙吃点好的", subtitle: tipSummary) {
                             withAnimation(.easeOut(duration: 0.18)) { showTipChooser = true }
                         }
                         settingsRow(emoji: "🔄", title: "恢复购买") {
                             Task {
                                 let restored = await store.restore()
-                                restoreMsg = restored ? "已恢复购买 🎉" : "没有可恢复的购买"
+                                noticeMsg = restored ? "已恢复购买 🎉" : "没有可恢复的购买"
                             }
                         }
 
@@ -122,9 +138,9 @@ struct SettingsView: View {
                     Text("请奶蛙吃点好的 💛")
                         .font(.system(size: 17, weight: .bold)).foregroundColor(.black)
                     HStack(spacing: 16) {
-                        tipOption(image: "打赏奶茶", title: "喝奶茶",
+                        tipOption(image: "打赏奶茶", title: "喝奶茶", kind: .milktea,
                                   id: StoreManager.ProductID.milkTea, fallback: "¥6")
-                        tipOption(image: "打赏美食", title: "吃美食",
+                        tipOption(image: "打赏美食", title: "吃美食", kind: .food,
                                   id: StoreManager.ProductID.food, fallback: "¥12")
                     }
                     Button("以后再说") {
@@ -189,25 +205,33 @@ struct SettingsView: View {
         .sheet(isPresented: $showShareSheet) {
             ShareSheet(items: [URL(string: Self.appStoreURL)!])
         }
-        .alert("恢复购买", isPresented: Binding(get: { restoreMsg != nil },
-                                          set: { if !$0 { restoreMsg = nil } })) {
-            Button("好的", role: .cancel) { restoreMsg = nil }
+        .alert("提示", isPresented: Binding(get: { noticeMsg != nil },
+                                          set: { if !$0 { noticeMsg = nil } })) {
+            Button("好的", role: .cancel) { noticeMsg = nil }
         } message: {
-            Text(restoreMsg ?? "")
+            Text(noticeMsg ?? "")
         }
     }
 
     // MARK: Row
 
-    private func settingsRow(emoji: String, title: String, action: @escaping () -> Void) -> some View {
+    private func settingsRow(emoji: String, title: String, subtitle: String? = nil,
+                             action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 12) {
                 Text(emoji)
                     .font(.system(size: 22))
                     .frame(width: 28)
-                Text(title)
-                    .font(.system(size: 17))
-                    .foregroundColor(.black)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 17))
+                        .foregroundColor(.black)
+                    if let subtitle {
+                        Text(subtitle)
+                            .font(.system(size: 12))
+                            .foregroundColor(Color(red: 0.95, green: 0.55, blue: 0.2))
+                    }
+                }
                 Spacer()
                 Image(systemName: "chevron.right")
                     .font(.system(size: 14, weight: .medium))
@@ -227,27 +251,44 @@ struct SettingsView: View {
             .padding(.vertical, 4)
     }
 
-    /// One tip choice (奶茶 / 美食) — image + name + price, buys on tap.
-    private func tipOption(image: String, title: String, id: String, fallback: String) -> some View {
+    /// One tip choice (奶茶 / 美食) — image + name + price, buys on tap. The tip
+    /// count itself is bumped centrally via StoreManager.onTipPaid → recordTip
+    /// (so async/deferred tips also count); here we only drive the UI feedback.
+    private func tipOption(image: String, title: String, kind: TipKind,
+                           id: String, fallback: String) -> some View {
         let price = store.displayPrice(id)
+        let count = tipCount(kind)
         return Button {
             Task {
-                if await store.purchase(id) {
-                    Analytics.log(.tipPurchased(kind: id == StoreManager.ProductID.milkTea ? "milktea" : "food"))
+                switch await store.purchase(id) {
+                case .success:
+                    Analytics.log(.tipPurchased(kind: kind == .milktea ? "milktea" : "food"))
                     withAnimation(.easeOut(duration: 0.2)) {
                         showTipChooser = false
-                        thanksKind = (id == StoreManager.ProductID.milkTea) ? .milktea : .food
+                        thanksKind = kind
                     }
+                case .pending:
+                    withAnimation(.easeOut(duration: 0.2)) { showTipChooser = false }
+                    noticeMsg = "购买处理中，完成后会自动记上 🕓"
+                case .failed:
+                    noticeMsg = "购买没成功，请稍后再试"
+                case .cancelled:
+                    break
                 }
             }
         } label: {
-            VStack(spacing: 8) {
-                Image(image).resizable().scaledToFit().frame(width: 74, height: 74)
+            VStack(spacing: 6) {
+                Image(image).resizable().scaledToFit().frame(width: 70, height: 70)
                 Text(title).font(.system(size: 15, weight: .semibold)).foregroundColor(.black)
                 Text(price.isEmpty ? fallback : price)
                     .font(.system(size: 13, weight: .medium)).foregroundColor(.secondary)
+                if count > 0 {
+                    Text("已请 ×\(count)")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color(red: 0.95, green: 0.55, blue: 0.2))
+                }
             }
-            .frame(width: 108, height: 150)
+            .frame(width: 108, height: 158)
             .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Color.black.opacity(0.04)))
         }
     }
@@ -338,6 +379,6 @@ struct SettingsView: View {
 
 #Preview {
     NavigationStack {
-        SettingsView(store: StoreManager(), onClose: {})
+        SettingsView(store: StoreManager(), economy: Economy(), onClose: {})
     }
 }

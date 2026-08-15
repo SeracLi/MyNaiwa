@@ -491,6 +491,20 @@ final class NaiwaVoice: ObservableObject {
         try? session.setActive(true)
     }
 
+    /// Re-assert the resting .playback session and stop any dangling engine/tap.
+    /// Called by the player's self-heal after a system interruption (e.g. the
+    /// StoreKit purchase sheet or a phone call) leaves the session deactivated —
+    /// without this the AVPlayers stay paused and奶蛙 appears frozen.
+    func recoverAudioSession() {
+        engine.mainMixerNode.removeTap(onBus: 0)
+        onPlaybackAudible = nil
+        if engine.isRunning { engine.stop() }
+        isRecording = false
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback, mode: .default)
+        try? session.setActive(true)
+    }
+
     // MARK: Record
 
     func startRecording() {
@@ -759,6 +773,10 @@ final class NaiwaPlayer: ObservableObject {
     /// Fired after the FIRST mic-permission request resolves (granted flag) so
     /// the UI can hint ("mic enabled, hold to talk" / "enable it in Settings").
     var onMicResult: ((Bool) -> Void)?
+    /// Fired whenever the player self-heals out of a stuck/frozen state (audio
+    /// interruption recovery, the liveness watchdog, or a wake-up tap) so the UI
+    /// can reassure the user with a gentle toast.
+    var onSelfHeal: (() -> Void)?
 
     /// KVO tokens kept alive so we can preroll each clip once its item is ready.
     private var prewarmObservers: [NSKeyValueObservation] = []
@@ -772,6 +790,14 @@ final class NaiwaPlayer: ObservableObject {
     private var pendingSpeakStart = false
     private var lastRecordingDuration: TimeInterval = 0
     private var talkModeReady = false
+
+    /// Liveness watchdog. While奶蛙 is in a NON-looping clip, we periodically check
+    /// that the clip is actually advancing. A clip that should be playing but sits
+    /// at rate 0 is the fingerprint of an interrupted audio session (e.g. after
+    /// the StoreKit sheet) — when we see that, we self-heal to idle so the app
+    /// can never get stuck frozen. Looping clips (idle/listen/speak) are exempt.
+    private var watchdog: DispatchWorkItem?
+    private static let loopingClips: Set<NaiwaClip> = [.idle, .talkListen, .talkSpeak]
 
     init() {
         for clip in NaiwaClip.allCases {
@@ -887,10 +913,37 @@ final class NaiwaPlayer: ObservableObject {
             forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.recoverFromBackground()
+                self?.recoverToIdle()
             }
         }
-        lifecycleObservers = [bg, fg]
+
+        // A system layer presented OVER the app (StoreKit purchase sheet, an
+        // incoming call, Siri) interrupts the audio session WITHOUT backgrounding
+        // us, so the bg/fg pair above never fires and the paused AVPlayers stay
+        // frozen. Listen for the interruption directly and heal when it ends —
+        // this is the core fix for "app frozen after completing a purchase".
+        let interrupt = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  AVAudioSession.InterruptionType(rawValue: raw) == .ended else { return }
+            Task { @MainActor [weak self] in self?.selfHeal(reason: "interruption-ended") }
+        }
+
+        // Belt-and-suspenders: some interruptions never post an `.ended`. When the
+        // app becomes active again after any system modal, heal if — and only if —
+        // the current clip has stalled, so a normal foreground never disturbs a
+        // healthy scene.
+        let active = NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.isStalled else { return }
+                self.selfHeal(reason: "becameActive-stalled")
+            }
+        }
+
+        lifecycleObservers = [bg, fg, interrupt, active]
     }
 
     /// Returning from background, AVPlayerLayers often go blank — the render
@@ -899,7 +952,8 @@ final class NaiwaPlayer: ObservableObject {
     /// all clips to frame 0, then cleanly resume the idle loop. Any interrupted
     /// talk-mode flow is abandoned (recording/playback can't survive a
     /// background transition), so we always land in a known-good idle state.
-    private func recoverFromBackground() {
+    private func recoverToIdle() {
+        cancelWatchdog()
         if state.isInTalkMode {
             voice.stopPlayback()
         }
@@ -923,6 +977,58 @@ final class NaiwaPlayer: ObservableObject {
         players[.idle]?.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
             Task { @MainActor [weak self] in self?.players[.idle]?.play() }
         }
+    }
+
+    // MARK: Self-heal (never let奶蛙 stay frozen)
+
+    /// True when the current clip has stalled — the fingerprint of a frozen
+    /// scene. idle must always be advancing; a non-looping clip that sits at
+    /// rate 0 (and isn't mid-seek) is stuck; a talk clip at rate 0 while the user
+    /// isn't holding the button is stuck too.
+    private var isStalled: Bool {
+        guard let p = players[currentClip] else { return true }
+        if Self.loopingClips.contains(currentClip) {
+            if currentClip == .idle { return p.rate == 0 }
+            return p.rate == 0 && !isButtonHeld          // talkListen / talkSpeak
+        }
+        return p.rate == 0 && !actionSeeking
+    }
+
+    /// Reset the audio session AND the video to a known-good idle, then notify the
+    /// UI. The single recovery entry point for every stuck path.
+    private func selfHeal(reason: String) {
+        #if DEBUG
+        print("🩹 selfHeal: \(reason)")
+        #endif
+        voice.recoverAudioSession()
+        recoverToIdle()
+        onSelfHeal?()
+    }
+
+    private func cancelWatchdog() { watchdog?.cancel(); watchdog = nil }
+
+    /// Arm the liveness watchdog for a freshly-started non-looping clip.
+    private func armWatchdog(for clip: NaiwaClip) {
+        cancelWatchdog()
+        scheduleWatchdogProbe(clip: clip, expecting: state)
+    }
+
+    /// Re-check ~every 1.5s: if we've left this clip/state, stop; if it's still
+    /// advancing, keep watching; if it has stalled, heal.
+    private func scheduleWatchdogProbe(clip: NaiwaClip, expecting expected: NaiwaState) {
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.currentClip == clip, self.state == expected else { return }
+                let rate = self.players[clip]?.rate ?? 0
+                if rate > 0 || self.actionSeeking {
+                    self.scheduleWatchdogProbe(clip: clip, expecting: expected)   // still alive
+                } else {
+                    self.selfHeal(reason: "stalled:\(clip.rawValue)")
+                }
+            }
+        }
+        watchdog = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
     }
 
     private func wireVoice() {
@@ -1030,6 +1136,8 @@ final class NaiwaPlayer: ObservableObject {
                     p?.play()
                 }
             }
+            // A same-clip restart: keep the watchdog in sync (loop clips exempt).
+            if Self.loopingClips.contains(next) { cancelWatchdog() } else { armWatchdog(for: next) }
             return
         }
 
@@ -1053,11 +1161,24 @@ final class NaiwaPlayer: ObservableObject {
         oldPlayer?.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
 
         currentClip = next
+
+        // Watch non-looping clips for stalls; looping clips (idle/listen/speak)
+        // are self-sustaining and must not be watched (they'd false-trigger).
+        if Self.loopingClips.contains(next) { cancelWatchdog() } else { armWatchdog(for: next) }
     }
 
     // MARK: Tap dispatch (existing flow — unchanged)
 
     func handleTap(_ zone: TapZone) {
+        // Wake-up tap: if奶蛙 looks frozen (a clip that should be advancing has
+        // stalled — the signature of an audio-session interruption that never
+        // resumed), a tap heals it back to idle. Users instinctively poke the
+        // character to "wake" it, so we honor that as a recovery gesture.
+        if isStalled {
+            selfHeal(reason: "tap")
+            return
+        }
+
         // "连续点击倒退继播": if the user re-taps the SAME zone that started the
         // current interaction, rewind it ~0.5s and keep playing (打枪/太极 feel,
         // now on 大笑/摸肚子/浮起来/挠头 too). `interactionRewindZone` is only set
@@ -1153,8 +1274,14 @@ final class NaiwaPlayer: ObservableObject {
 
         if talkModeReady {
             // Fast path — fully synchronous, no race window for stale callbacks.
-            _ = voice.enterTalkMode()
-            beginTalk(interrupt: isInterrupt)
+            if voice.enterTalkMode() {
+                beginTalk(interrupt: isInterrupt)
+            } else {
+                // Session/engine failed to start (typically a stale session left
+                // by an interruption). Heal to idle instead of entering a red talk
+                // state whose clip can never resolve — the next press then works.
+                selfHeal(reason: "enterTalkMode-failed")
+            }
         } else {
             // First-ever press with permission not yet granted: request it but
             // DON'T enter talk mode. The system dialog steals the touch, so the
@@ -1687,7 +1814,7 @@ struct ContentView: View {
                 // appears/fades instead of sliding up from the bottom.
                 if showSettings {
                     NavigationStack {
-                        SettingsView(store: store, onClose: {
+                        SettingsView(store: store, economy: economy, onClose: {
                             withAnimation(.easeInOut(duration: 0.15)) { showSettings = false }
                         })
                     }
@@ -1720,11 +1847,47 @@ struct ContentView: View {
                         .ignoresSafeArea()
                         .transition(.opacity)
                     dialogShell(image: "加特林", emoji: "💥", glow: true, title: "太幸运了！",
-                                message: "你的奶蛙偶然捡到了加特林！已解锁，送你 5 次",
-                                primary: "收下", secondary: nil) {
+                                message: Text("你的奶蛙偶然捡到了加特林！已解锁，送你 5 次"),
+                                primary: Text("收下"), secondary: nil) {
                         withAnimation(.easeOut(duration: 0.2)) { economy.clearGatlingCelebration() }
                     }
                     .transition(.scale(scale: 0.8).combined(with: .opacity))
+                }
+
+                // 礼包 unlock celebration. Fires from markPackOwned's first
+                // not-owned→owned flip, so it shows no matter which path (the
+                // synchronous purchase return, the async Transaction.updates
+                // listener, or a restore) delivered the deal — replacing the old
+                // easy-to-miss 1.6s toast that the reviewer never saw.
+                if let pack = economy.justUnlockedPack {
+                    let name = NaiwaAction.byId(pack)?.name ?? "礼包"
+                    Color.black.opacity(0.45)
+                        .ignoresSafeArea()
+                        .transition(.opacity)
+                    dialogShell(image: "打枪礼包", emoji: "🔫", glow: true, title: "解锁成功！",
+                                message: Text("「\(name)」已永久无限次解锁，长按它就能装备到右手啦"),
+                                primary: Text("好耶"), secondary: nil) {
+                        withAnimation(.easeOut(duration: 0.2)) { economy.clearPackCelebration() }
+                    }
+                    .transition(.scale(scale: 0.8).combined(with: .opacity))
+                }
+
+                // Payment-in-progress shield. StoreKit presents its own sheet, but
+                // between tapping buy and that sheet appearing — and again while we
+                // verify + finish the transaction — there's a gap where taps used
+                // to leak into the scene and spawn edge-case states. Block it.
+                if store.isBusy {
+                    Color.black.opacity(0.32)
+                        .ignoresSafeArea()
+                        .overlay(
+                            VStack(spacing: 14) {
+                                ProgressView().controlSize(.large).tint(.white)
+                                Text("支付处理中…")
+                                    .font(.system(size: 14, weight: .medium))
+                                    .foregroundColor(.white)
+                            }
+                        )
+                        .transition(.opacity)
                 }
 
                 // Launch cover — plain black, held on top until the video's first
@@ -1765,6 +1928,7 @@ struct ContentView: View {
                 if granted { showToast("麦克风已开启，按住我就能说话啦 🎙️") }
                 else { showMicDeniedAlert = true }
             }
+            naiwa.onSelfHeal = { showToast("奶蛙缓过神来啦，继续玩吧～") }
             economy.beginCompanionSession()
         }
         .onChange(of: scenePhase) { _, phase in
@@ -1781,8 +1945,15 @@ struct ContentView: View {
         .task {
             Analytics.log(.appOpen)
             // IAP: grant the founder pack from entitlements (purchase/restore/
-            // cross-device), then correct a stale equipped action.
+            // cross-device), then correct a stale equipped action. markPackOwned
+            // fires the unlock celebration only on the first not-owned→owned flip,
+            // so re-granting here every launch stays silent. A paid tip bumps its
+            // lifetime count (also via the async listener, so deferred tips count).
             store.onGunOwned = { economy.markPackOwned("gun") }
+            store.onTipPaid = { kind in economy.recordTip(kind) }
+            // Preload products up front so price is ready BEFORE any dialog opens —
+            // no more "解锁" with a blank price that loads only after you tap.
+            await store.loadProducts()
             await store.refreshEntitlements()
             validateEquip()
             // Periodic companion flush so the 5-minute task can complete while
@@ -1982,8 +2153,8 @@ struct ContentView: View {
         switch d {
         case .unlock(let id, let name, let emoji):
             dialogShell(image: NaiwaAction.byId(id)?.image, emoji: emoji, title: "解锁 \(name)",
-                        message: "花 \(Economy.freeUnlockCost) 🪙 解锁，先送你 \(Economy.freeUnlockUses) 次",
-                        primary: "花 \(Economy.freeUnlockCost) 🪙 解锁", secondary: "以后再说") {
+                        message: Text("花 ") + coinAmt(Economy.freeUnlockCost) + Text(" 解锁，先送你 \(Economy.freeUnlockUses) 次"),
+                        primary: Text("花 ") + coinAmt(Economy.freeUnlockCost) + Text(" 解锁"), secondary: "以后再说") {
                 if economy.unlockFree(id) {
                     postUnlock(id); dismissDialog()
                     Analytics.log(.unlockSucceeded(id: id, cost: Economy.freeUnlockCost))
@@ -1995,8 +2166,8 @@ struct ContentView: View {
             }
         case .unlockPermanent(let id, let name, let emoji):
             dialogShell(image: NaiwaAction.byId(id)?.image, emoji: emoji, title: "解锁 \(name)",
-                        message: "花 \(Economy.freeUnlockCost) 🪙 永久解锁 \(name)，之后随便用",
-                        primary: "花 \(Economy.freeUnlockCost) 🪙 永久解锁", secondary: "以后再说") {
+                        message: Text("花 ") + coinAmt(Economy.freeUnlockCost) + Text(" 永久解锁 \(name)，之后随便用"),
+                        primary: Text("花 ") + coinAmt(Economy.freeUnlockCost) + Text(" 永久解锁"), secondary: "以后再说") {
                 if economy.unlockPermanent(id) {
                     postUnlock(id); dismissDialog()
                     Analytics.log(.unlockSucceeded(id: id, cost: Economy.freeUnlockCost))
@@ -2008,8 +2179,8 @@ struct ContentView: View {
             }
         case .refill(let id, let name, let emoji):
             dialogShell(image: NaiwaAction.byId(id)?.image, emoji: emoji, title: "\(name) 次数用完了",
-                        message: "花 \(Economy.refillCost) 🪙 再来 \(Economy.refillUses) 次",
-                        primary: "花 \(Economy.refillCost) 🪙 购买", secondary: "以后再说") {
+                        message: Text("花 ") + coinAmt(Economy.refillCost) + Text(" 再来 \(Economy.refillUses) 次"),
+                        primary: Text("花 ") + coinAmt(Economy.refillCost) + Text(" 购买"), secondary: "以后再说") {
                 if economy.refill(id) {
                     postUnlock(id); dismissDialog()
                     Analytics.log(.refilled(id: id))
@@ -2021,11 +2192,15 @@ struct ContentView: View {
             }
         case .founder(let id, let name, let emoji):
             let price = store.displayPrice(StoreManager.ProductID.gunPack)
+            let priceReady = !price.isEmpty
             let previewsLeft = Economy.packPreviewLimit - economy.progress(id).previewsUsed
             dialogShell(image: "打枪礼包", emoji: emoji, glow: true, title: "创始人礼包 · \(name)",
-                        message: "解锁后永久无限次\(name)\(price.isEmpty ? "" : "（\(price)）")，并可长按装备到右手。",
-                        primary: store.isBusy ? "购买中…" : (price.isEmpty ? "解锁" : "\(price) 解锁"),
+                        message: Text("解锁后永久无限次\(name)\(priceReady ? "（\(price)）" : "")，并可长按装备到右手。"),
+                        // Never show a bare "解锁" with no price — disable and show a
+                        // loading label until the real price is in hand.
+                        primary: Text(store.isBusy ? "购买中…" : (priceReady ? "\(price) 解锁" : "价格加载中…")),
                         secondary: "以后再说",
+                        primaryEnabled: priceReady && !store.isBusy,
                         extra: previewsLeft > 0
                             ? (title: "先试玩一次（还剩 \(previewsLeft) 次）", action: {
                                 economy.consumePreview(id)
@@ -2034,23 +2209,47 @@ struct ContentView: View {
                               })
                             : nil) {
                 Task {
-                    if await store.purchase(StoreManager.ProductID.gunPack) {
-                        dismissDialog()
-                        Analytics.log(.founderPurchased)
-                        showToast("🔫 打枪 已解锁，永久无限!")
+                    // Success unlock + celebration are driven by markPackOwned →
+                    // justUnlockedPack (fires on ANY delivery path), so here we just
+                    // dismiss and handle the non-success outcomes.
+                    switch await store.purchase(StoreManager.ProductID.gunPack) {
+                    case .success:   dismissDialog()
+                    case .pending:   dismissDialog(); showToast("购买处理中，完成后会自动解锁 🕓")
+                    case .failed:    showToast("购买没成功，请稍后再试")
+                    case .cancelled: break
                     }
                 }
             }
         case .notEnough(let needed):
             dialogShell(emoji: "🙈", title: "奶币不够啦",
-                        message: "还差一点，先陪奶蛙多玩会儿赚奶币吧（需要 \(needed) 🪙）",
-                        primary: "好的", secondary: nil) { dismissDialog() }
+                        message: Text("还差一点，先陪奶蛙多玩会儿赚奶币吧（需要 ") + coinAmt(needed) + Text("）"),
+                        primary: Text("好的"), secondary: nil) { dismissDialog() }
         }
     }
 
+    /// A pre-shrunk 奶币 image for inline use in Text. Text renders an
+    /// interpolated raster image at its NATURAL point size, so the full-res PNG
+    /// looked huge — we render it into a small (15pt) bitmap once.
+    private static let inlineCoin: Image = {
+        let size = CGSize(width: 17, height: 17)
+        let base = UIImage(named: "奶币") ?? UIImage()
+        let small = UIGraphicsImageRenderer(size: size).image { _ in
+            base.draw(in: CGRect(origin: .zero, size: size))
+        }
+        return Image(uiImage: small)
+    }()
+
+    /// Inline 奶币 + amount for dialog text. The coin gets a negative baseline
+    /// offset so it sits vertically centered with the digits (an interpolated
+    /// image otherwise aligns to the text baseline and looks too high).
+    private func coinAmt(_ n: Int) -> Text {
+        Text("\(n) ") + Text("\(Self.inlineCoin)").baselineOffset(-3)
+    }
+
     private func dialogShell(image: String? = nil, emoji: String, glow: Bool = false,
-                             title: String, message: String,
-                             primary: String, secondary: String?,
+                             title: String, message: Text,
+                             primary: Text, secondary: String?,
+                             primaryEnabled: Bool = true,
                              extra: (title: String, action: () -> Void)? = nil,
                              onPrimary: @escaping () -> Void) -> some View {
         VStack(spacing: 14) {
@@ -2063,15 +2262,16 @@ struct ContentView: View {
             }
             .background { if glow { giftGlow(124) } }
             Text(title).font(.system(size: 18, weight: .bold)).foregroundColor(.primary)
-            Text(message).font(.system(size: 14)).foregroundColor(.secondary)
+            message.font(.system(size: 14)).foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
             VStack(spacing: 8) {
                 Button(action: onPrimary) {
-                    Text(primary).font(.system(size: 16, weight: .semibold))
+                    primary.font(.system(size: 16, weight: .semibold))
                         .frame(maxWidth: .infinity).padding(.vertical, 13)
-                        .background(Color.black).foregroundColor(.white)
+                        .background(Color.black.opacity(primaryEnabled ? 1 : 0.4)).foregroundColor(.white)
                         .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
                 }
+                .disabled(!primaryEnabled)
                 if let extra {
                     Button(action: extra.action) {
                         Text(extra.title).font(.system(size: 15, weight: .semibold))
