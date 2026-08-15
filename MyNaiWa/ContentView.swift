@@ -2213,7 +2213,7 @@ struct ContentView: View {
     private func actionLockText(_ a: NaiwaAction) -> String {
         switch a.tier {
         case .free, .unlockable: return "\(Economy.freeUnlockCost)奶币解锁"
-        case .pack:              return "创始人礼包"
+        case .pack:              return "奶家人创始礼包"
         default:                 return ""
         }
     }
@@ -2294,7 +2294,7 @@ struct ContentView: View {
             let price = store.displayPrice(StoreManager.ProductID.gunPack)
             let priceReady = !price.isEmpty
             let previewsLeft = Economy.packPreviewLimit - economy.progress(id).previewsUsed
-            dialogShell(image: "打枪礼包", emoji: emoji, glow: true, title: "创始人礼包 · \(name)",
+            dialogShell(image: "打枪礼包", emoji: emoji, glow: true, title: "奶家人创始礼包 · \(name)",
                         message: Text("解锁后永久无限次\(name)\(priceReady ? "（\(price)）" : "")，并可长按装备到右手。"),
                         // Never show a bare "解锁" with no price — disable and show a
                         // loading label until the real price is in hand.
