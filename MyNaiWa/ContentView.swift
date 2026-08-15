@@ -780,6 +780,9 @@ final class NaiwaPlayer: ObservableObject {
 
     /// KVO tokens kept alive so we can preroll each clip once its item is ready.
     private var prewarmObservers: [NSKeyValueObservation] = []
+    /// True once the collectible action clips have been background-warmed; reset
+    /// when a memory warning tears them down so the next panel-open re-warms.
+    private var actionClipsWarm = false
 
     // Talk-mode bookkeeping
     private var isButtonHeld = false
@@ -818,12 +821,17 @@ final class NaiwaPlayer: ObservableObject {
             players[clip] = p
             layers[clip] = l
 
-            if let url = url(for: clip) {
-                let item = AVPlayerItem(url: url)
-                p.replaceCurrentItem(with: item)
-                attachEndObserver(for: clip, item: item)
-            } else {
-                print("⚠️ Missing video: \(clip.rawValue).mp4")
+            // Eagerly load only the hot clips at launch. The collectible action
+            // clips stay item-less until the 动作 panel opens (warmActionClips) or a
+            // tap needs them (ensureLoaded) — so launch never opens all 20 2K assets.
+            if Self.hotClips.contains(clip) {
+                if let url = url(for: clip) {
+                    let item = AVPlayerItem(url: url)
+                    p.replaceCurrentItem(with: item)
+                    attachEndObserver(for: clip, item: item)
+                } else {
+                    print("⚠️ Missing video: \(clip.rawValue).mp4")
+                }
             }
         }
         if let saved = UserDefaults.standard.string(forKey: "naiwa_equippedAction"),
@@ -839,6 +847,11 @@ final class NaiwaPlayer: ObservableObject {
         }
         players[.idle]?.play()
         prewarmDecoders()
+        // Also warm the equipped right-hand action if it's a cold clip — it's a
+        // single tap away on the character, so a first-tap hitch there is the most
+        // noticeable one to avoid.
+        let equipped = equippedClip
+        if !Self.hotClips.contains(equipped) { ensureLoaded(equipped); prerollWhenReady(equipped) }
 
         // Signal when the idle clip's first frame is actually displayed (KVO on
         // isReadyForDisplay), so the launch cover can fade at exactly the right
@@ -873,20 +886,43 @@ final class NaiwaPlayer: ObservableObject {
     /// first-play glitch where B-frame decode reordering briefly shows an
     /// earlier frame (most visible on the 聆听 clip, which was re-encoded in
     /// Premiere). `preroll` fills buffers without advancing or making sound.
+    /// Preroll only the high-frequency hot clips at launch (idle is already
+    /// playing). Prerolling all 20 2K pipelines spikes launch memory and risks a
+    /// jetsam kill on 3GB devices.
     private func prewarmDecoders() {
-        for (clip, player) in players {
-            // idle is already playing (warm). Only preroll the high-frequency hot
-            // clips — prerolling all 20 2K pipelines spikes launch memory and risks
-            // a jetsam kill on 3GB devices. Action clips warm lazily on first use.
-            guard clip != .idle, Self.hotClips.contains(clip), let item = player.currentItem else { continue }
-            if item.status == .readyToPlay {
-                player.preroll(atRate: 1.0)
-            } else {
-                let obs = item.observe(\.status, options: [.new]) { [weak player] observed, _ in
-                    guard observed.status == .readyToPlay else { return }
-                    Task { @MainActor [weak player] in player?.preroll(atRate: 1.0) }
-                }
-                prewarmObservers.append(obs)
+        for clip in Self.hotClips where clip != .idle { prerollWhenReady(clip) }
+    }
+
+    /// Preroll one clip's decode pipeline once its item is ready (fills buffers
+    /// without advancing or making sound), so its first real playback is hot.
+    private func prerollWhenReady(_ clip: NaiwaClip) {
+        guard let player = players[clip], let item = player.currentItem else { return }
+        if item.status == .readyToPlay {
+            player.preroll(atRate: 1.0)
+        } else {
+            let obs = item.observe(\.status, options: [.new]) { [weak player] observed, _ in
+                guard observed.status == .readyToPlay else { return }
+                Task { @MainActor [weak player] in player?.preroll(atRate: 1.0) }
+            }
+            prewarmObservers.append(obs)
+        }
+    }
+
+    /// Background-warm the collectible action clips (create item + preroll), one
+    /// at a time, when the 动作 panel opens — by the time the panel's open
+    /// animation finishes they're hot, so taps play instantly, yet launch paid
+    /// nothing. `ensureLoaded` still guarantees playability if a tap beats the
+    /// warm. No-op once warm; reset by a memory-warning teardown.
+    func warmActionClips() {
+        guard !actionClipsWarm else { return }
+        actionClipsWarm = true
+        let cold = NaiwaClip.allCases.filter { !Self.hotClips.contains($0) }
+        Task { @MainActor [weak self] in
+            for clip in cold {
+                guard let self, self.actionClipsWarm else { return }
+                self.ensureLoaded(clip)
+                self.prerollWhenReady(clip)
+                try? await Task.sleep(nanoseconds: 300_000_000)
             }
         }
     }
@@ -1163,6 +1199,7 @@ final class NaiwaPlayer: ObservableObject {
             }
             player.replaceCurrentItem(with: nil)
         }
+        actionClipsWarm = false   // let the next 动作-panel open re-warm them
     }
 
     private func switchTo(_ next: NaiwaClip) {
@@ -2476,7 +2513,10 @@ struct ContentView: View {
     }
 
     private func toggleActionsPanel() {
-        if !actionsPanelOpen { Analytics.log(.panelOpened(kind: "action")) }
+        if !actionsPanelOpen {
+            Analytics.log(.panelOpened(kind: "action"))
+            naiwa.warmActionClips()   // background-warm the action clips as it opens
+        }
         withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
             voicesPanelOpen = false
             actionsPanelOpen.toggle()
