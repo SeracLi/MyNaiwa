@@ -1002,8 +1002,13 @@ final class NaiwaPlayer: ObservableObject {
     /// Abort a talk session that's still "held" when the app leaves the active
     /// state (a system layer can swallow the DragGesture's onEnded, stranding the
     /// button red and recording to the 10s cap). Called on scenePhase change.
+    ///
+    /// Only the HELD phase (talkEntering/listening, where isButtonHeld is true) can
+    /// be stranded by a swallowed gesture-end. The playback phase (speaking/
+    /// talkExiting, button already released) must be left alone — otherwise pulling
+    /// down Control Center mid-replay would cut奶蛙 off in the middle of a sentence.
     func abortTalkIfHeld() {
-        guard isButtonHeld || state.isInTalkMode else { return }
+        guard isButtonHeld else { return }
         voice.recoverAudioSession()
         recoverToIdle()
     }

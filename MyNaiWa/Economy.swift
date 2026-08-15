@@ -215,7 +215,11 @@ final class Economy: ObservableObject {
         // to iCloud so a genuine new user's progress is backed up.
         if isFreshSnapshot {
             Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 8_000_000_000)
+                // 30s, not 8s: a new device's first KVS pull often takes >8s, and
+                // promoting too early pushes the seed to cloud and drops us back to
+                // timestamp comparison (the monotonic fallback in adoptCloudIfNewer
+                // is the backstop for the rare case the real save still arrives late).
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
                 guard let self, self.isFreshSnapshot else { return }
                 self.isFreshSnapshot = false
                 self.persist()
@@ -476,8 +480,16 @@ final class Economy: ObservableObject {
         // Still on the provisional fresh seed → the cloud copy is the real save;
         // adopt it unconditionally (our seed's `now` timestamp is meaningless).
         if isFreshSnapshot { apply(remote); return }
-        guard remote.updatedAt > updatedAt else { return }
-        apply(remote)
+        // If the grace timer already promoted a barely-touched local seed before
+        // iCloud finished its first sync, the real save arrives with an OLDER
+        // timestamp and the check above would reject it. Guard with a monotonic
+        // progress fallback: lifetimeInteractions only ever grows, so a cloud copy
+        // with MORE progress than a young local one is the genuine save.
+        let localIsYoung = activeDays <= 1 && lifetimeInteractions < 30
+        if remote.updatedAt > updatedAt ||
+           (localIsYoung && (remote.lifetimeInteractions ?? 0) > lifetimeInteractions) {
+            apply(remote)
+        }
     }
 
     private func apply(_ s: Snapshot) {
