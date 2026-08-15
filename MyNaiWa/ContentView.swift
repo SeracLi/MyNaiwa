@@ -1125,7 +1125,8 @@ final class NaiwaPlayer: ObservableObject {
                 let next: NaiwaClip = (lastFiller == .belly) ? .head : .belly
                 lastFiller = next
                 state = (next == .belly) ? .fillerBelly : .fillerHead
-                // Character-initiated → not user-scrubbable (taps stay inert).
+                // Character-initiated → no owning rewind zone. A tap during it
+                // interrupts into a fresh reaction (handleTap) rather than scrubbing.
                 interactionRewindZone = nil
                 switchTo(next)
             } else {
@@ -1274,10 +1275,14 @@ final class NaiwaPlayer: ObservableObject {
             return
         }
 
-        // Otherwise a fresh interaction only starts from a resting idle. Taps
-        // during any ongoing clip (a running interaction, a self-filler, or
-        // talk mode) do nothing.
-        guard state == .idle else { return }
+        // A fresh interaction can begin from a resting idle OR from a
+        // character-initiated filler (奶蛙 idly patting its belly / scratching its
+        // head — these have NO owning rewind zone). Tapping during such a fidget
+        // interrupts it and plays the tapped reaction, exactly like tapping from
+        // idle. It may NOT interrupt an active USER interaction (rewind zone set),
+        // a laugh/float, or talk mode — those still only accept a same-zone rewind.
+        let isSelfFiller = (state == .fillerBelly || state == .fillerHead) && interactionRewindZone == nil
+        guard state == .idle || isSelfFiller else { return }
 
         switch zone {
         case .head:
